@@ -1,0 +1,38 @@
+[Unit]
+Description=OpenClaw Tenant Gateway (%i)
+Documentation=https://docs.openclaw.ai/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw-%i
+Group=openclaw-%i
+WorkingDirectory=/opt/openclaw-tenants/%i
+Environment=HOME=/opt/openclaw-tenants/%i
+Environment=OPENCLAW_HOME=/opt/openclaw-tenants/%i
+Environment=PATH=/opt/openclaw-tenants/%i/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+Environment=AWS_REGION=us-east-1
+Environment=AWS_DEFAULT_REGION=us-east-1
+Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+Environment=ENV_FILE=/run/openclaw-%i/env
+EnvironmentFile=-/opt/openclaw-tenants/%i/service.env
+RuntimeDirectory=openclaw-%i
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/openclaw-%i
+ExecStartPre=+/usr/local/bin/openclaw-fetch-telegram-token.sh
+EnvironmentFile=-/run/openclaw-%i/env
+ExecStartPre=/usr/bin/python3 /opt/openclaw-tenants/%i/bin/validate-openclaw-config /opt/openclaw-tenants/%i/openclaw.json
+ExecStart=/usr/bin/env AWS_PROFILE=default /usr/bin/openclaw gateway
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-%i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/openclaw-tenants /creds /var/log/openclaw /tmp
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+[Unit]
+Description=OpenClaw Gateway (Agent Cody)
+Documentation=https://docs.openclaw.ai/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/opt/openclaw
+Environment=HOME=/opt/openclaw
+Environment=OPENCLAW_HOME=/opt/openclaw
+Environment=PATH=/opt/openclaw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+Environment=AWS_REGION=us-east-1
+Environment=AWS_DEFAULT_REGION=us-east-1
+# WHISPER_LANGUAGE intentionally unset so stt-wrapper.sh lets whisper
+# auto-detect per utterance. To force a single language (en, ar, ...),
+# set WHISPER_LANGUAGE here; the wrapper passes it through as --language.
+Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+# systemd creates /run/openclaw with correct ownership before namespacing — no chicken-and-egg
+RuntimeDirectory=openclaw
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/openclaw
+
+# Phase 1b: fetch Telegram bot token from Secrets Manager into runtime dir.
+# `+` runs as root (escapes ProtectSystem); the script writes a 0600 env file owned by openclaw.
+# `-` on EnvironmentFile makes the file optional — service can still start to debug if fetch fails.
+ExecStartPre=+/usr/local/bin/openclaw-fetch-telegram-token.sh
+EnvironmentFile=-/run/openclaw/env
+ExecStartPre=/usr/bin/python3 /opt/openclaw/bin/validate-openclaw-config /opt/openclaw/openclaw.json
+
+# Bedrock auth on this EC2 host uses the instance role, but OpenClaw still wants an
+# AWS env marker for its Bedrock provider availability path.
+ExecStart=/usr/bin/env AWS_PROFILE=default /usr/bin/openclaw gateway
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw
+
+# Resource + security hardening — simple, not aggressive (we'll tighten in Phase 4)
+# NoNewPrivileges intentionally omitted — required for cody-admin sudo self-refresh
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/openclaw /creds /var/log/openclaw /tmp
+
+[Install]
+WantedBy=multi-user.target

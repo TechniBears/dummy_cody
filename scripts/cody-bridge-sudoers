@@ -1,0 +1,12 @@
+# /etc/sudoers.d/cody-bridge — installed by scripts/bridge-up on first run.
+# Grants ec2-user passwordless sudo for EXACTLY one binary:
+#   /usr/local/sbin/cody-bridge-helper
+# The helper itself validates all inputs and only touches:
+#   - /run/openclaw/env  (DASHBOARD_URL line only)
+#   - /opt/openclaw/workspace/skills/<name>/SKILL.md (install-skill)
+#   - systemctl restart openclaw
+#
+# Any change to the helper that broadens its surface must be reviewed; this
+# sudoers line is the trust boundary.
+Defaults!/usr/local/sbin/cody-bridge-helper !requiretty
+ubuntu ALL=(root) NOPASSWD: /usr/local/sbin/cody-bridge-helper

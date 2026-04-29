@@ -1,0 +1,14 @@
+[Unit]
+Description=Agent Cody — morning email brief (daily)
+Documentation=https://docs.openclaw.ai/
+
+[Timer]
+# Fires 03:30 UTC daily = 07:30 Asia/Dubai (UTC+4) / 06:30 Asia/Kuwait (UTC+3).
+# To change the local trigger, edit OnCalendar and run:
+#   systemctl daemon-reload && systemctl restart morning-brief.timer
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

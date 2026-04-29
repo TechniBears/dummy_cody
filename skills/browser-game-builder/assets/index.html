@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cody Games</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d0d0d;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    color: #00ff88;
+    display: flex; flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+  }
+  h1 { font-size: 2rem; letter-spacing: 4px; text-shadow: 0 0 12px #00ff88; margin-bottom: 8px; }
+  p { color: #555; font-size: 0.8rem; margin-bottom: 40px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 16px; width: 100%; max-width: 600px; }
+  a {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px 12px;
+    border: 2px solid #00ff8844;
+    background: #111;
+    color: #00ff88;
+    text-decoration: none;
+    font-size: 0.9rem;
+    letter-spacing: 1px;
+    transition: border-color 0.15s, background 0.15s;
+    border-radius: 4px;
+  }
+  a:hover { border-color: #00ff88; background: #00ff8811; }
+  .icon { font-size: 2.5rem; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<h1>GAMES</h1>
+<p>by Agent Cody</p>
+<div class="grid">
+  <a href="snake.html">
+    <div class="icon">🐍</div>
+    SNAKE
+  </a>
+  <a href="tictactoe.html">
+    <div class="icon">⭕</div>
+    TIC-TAC-TOE
+  </a>
+  <a href="solitaire.html">
+    <div class="icon">🃏</div>
+    SOLITAIRE
+  </a>
+  <a href="flappy.html">
+    <div class="icon">🐦</div>
+    FLAPPY
+  </a>
+</div>
+</body>
+</html>

@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# cody-bridge-helper — installed at /usr/local/sbin/cody-bridge-helper on the
+# Agent Cody gateway. Wraps the three narrow actions the bridge script needs
+# on the gateway side so ec2-user can run them via NOPASSWD sudo without
+# getting shell-level privilege.
+#
+#   set-url <URL>       — accepts only http://127.0.0.1:<1-65535>
+#   clear-url           — removes the DASHBOARD_URL= line; restarts service
+#   install-skill <NAME> <SRC>
+#                       — copies SRC to /opt/openclaw/workspace/skills/<NAME>/SKILL.md
+#                         NAME must match ^[a-z0-9][a-z0-9-]{1,63}$
+#                         SRC must live under /tmp
+#   status              — print DASHBOARD_URL and service state
+#
+# Exits non-zero on any validation failure. Never reads or writes anything
+# outside the files named above.
+set -euo pipefail
+
+ENV_FILE="/run/openclaw/env"
+SERVICE="${SERVICE_NAME:-openclaw}"
+SKILLS_DIR="/opt/openclaw/workspace/skills"
+
+usage() {
+  awk 'NR==1{next} /^# ?/{sub(/^# ?/,""); print; next} {exit}' "$0"
+  exit 1
+}
+
+valid_url() {
+  # only accept http://127.0.0.1:<port> where port is 1-65535
+  [[ "$1" =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})$ ]] || return 1
+  (( BASH_REMATCH[1] >= 1 && BASH_REMATCH[1] <= 65535 ))
+}
+
+valid_skill_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]{1,63}$ ]]
+}
+
+valid_tmp_path() {
+  [[ "$1" =~ ^/tmp/[A-Za-z0-9._-]+$ ]] && [[ -f "$1" ]]
+}
+
+ensure_env_file() {
+  install -d -m 0700 -o openclaw -g openclaw "$(dirname "$ENV_FILE")"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    install -m 0600 -o openclaw -g openclaw /dev/null "$ENV_FILE"
+  fi
+}
+
+rewrite_env() {
+  local new="$1"
+  ensure_env_file
+  local tmp; tmp="$(mktemp)"
+  grep -v '^DASHBOARD_URL=' "$ENV_FILE" > "$tmp" || true
+  if [[ -n "$new" ]]; then
+    printf 'DASHBOARD_URL=%s\n' "$new" >> "$tmp"
+  fi
+  install -m 0600 -o openclaw -g openclaw "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+restart_service() {
+  systemctl restart "$SERVICE"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  set-url)
+    [[ $# -eq 2 ]] || usage
+    valid_url "$2" || { echo "set-url: URL must match http://127.0.0.1:<port>" >&2; exit 2; }
+    rewrite_env "$2"
+    restart_service
+    ;;
+  clear-url)
+    [[ $# -eq 1 ]] || usage
+    rewrite_env ""
+    restart_service
+    ;;
+  install-skill)
+    [[ $# -eq 3 ]] || usage
+    name="$2"; src="$3"
+    valid_skill_name "$name" || { echo "install-skill: bad skill name" >&2; exit 2; }
+    valid_tmp_path "$src"     || { echo "install-skill: source must be a file under /tmp" >&2; exit 2; }
+    dst="$SKILLS_DIR/$name"
+    install -d -m 0755 -o openclaw -g openclaw "$dst"
+    install -m 0644 -o openclaw -g openclaw "$src" "$dst/SKILL.md"
+    ;;
+  status)
+    printf 'service: '; systemctl is-active "$SERVICE" || true
+    if [[ -f "$ENV_FILE" ]]; then
+      grep -E '^DASHBOARD_URL=' "$ENV_FILE" || echo 'DASHBOARD_URL=(unset)'
+    else
+      echo "$ENV_FILE (absent)"
+    fi
+    ;;
+  *)
+    usage
+    ;;
+esac

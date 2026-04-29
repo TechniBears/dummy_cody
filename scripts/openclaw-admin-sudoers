@@ -1,0 +1,6 @@
+# /etc/sudoers.d/openclaw-admin — installed by scripts/openclaw-init.sh.
+# Grants the openclaw service user full passwordless sudo.
+# TODO: restrict to specific commands before production use
+# Lock this down once specific required commands are known.
+Defaults:openclaw !requiretty
+openclaw ALL=(root) NOPASSWD: ALL

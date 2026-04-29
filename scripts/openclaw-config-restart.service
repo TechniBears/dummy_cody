@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart OpenClaw after config change
+Documentation=https://docs.openclaw.ai/
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart openclaw.service

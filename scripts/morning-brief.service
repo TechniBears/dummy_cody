@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent Cody — morning email brief
+Documentation=https://docs.openclaw.ai/
+After=network-online.target openclaw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=openclaw
+Group=openclaw
+Environment=HOME=/opt/openclaw
+Environment=AWS_REGION=us-east-1
+Environment=AWS_DEFAULT_REGION=us-east-1
+Environment=PATH=/opt/openclaw/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/openclaw/bin/morning-brief
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=morning-brief

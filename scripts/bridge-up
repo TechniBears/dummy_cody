@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# bridge-up — one-command secure bridge from the Agent Cody gateway to this
+# laptop's dashboard. Handles first-time gateway bootstrap, secret sync, skill
+# push, SSH reverse tunnel, DASHBOARD_URL wiring, service restart, and clean
+# teardown on Ctrl-C.
+#
+# The tunnel binds to the gateway's 127.0.0.1 only; the dashboard is never
+# reachable from the public internet. Follow-up actions on the gateway go
+# through a narrow sudoers entry installed during first-run bootstrap.
+#
+# Usage:
+#   BRIDGE_HOST=ec2-user@<gateway-host-or-ip> ./bridge-up
+#
+# Flags:
+#   --tunnel-only     Skip secret/skill/bootstrap steps; just tunnel+env+restart
+#   --deploy-only     Skill+secret+bootstrap only; no tunnel (one-shot setup)
+#   --status          Report what's installed on the gateway and exit
+#   --help            This help
+#
+# Env (all optional unless noted):
+#   BRIDGE_HOST          REQUIRED. "user@host" for SSH.
+#   BRIDGE_SSH_OPTS      Extra ssh opts (e.g. "-i ~/.ssh/cody-gw.pem")
+#   CODY_DASHBOARD_DIR   Local dashboard repo path. Default: sibling
+#                        ../agent-cody-dashboard, then fallback ./dashboard.
+#   DASHBOARD_PORT       Local laptop port (default 3000)
+#   REMOTE_PORT          Gateway loopback port (default 3000)
+#   SERVICE_NAME         systemd unit on gateway (default openclaw)
+#   AWS_SECRET_NAME      default agent-cody/dashboard/bot-callback-secret
+#   AWS_REGION           default us-east-1
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEFAULT_DASHBOARD_DIR="$(cd "$REPO_ROOT/.." && pwd)/agent-cody-dashboard"
+if [[ -n "${CODY_DASHBOARD_DIR:-}" ]]; then
+  DASHBOARD_DIR="$CODY_DASHBOARD_DIR"
+elif [[ -d "$DEFAULT_DASHBOARD_DIR" ]]; then
+  DASHBOARD_DIR="$DEFAULT_DASHBOARD_DIR"
+else
+  echo "bridge-up: dashboard repo not found. Expected sibling $DEFAULT_DASHBOARD_DIR or CODY_DASHBOARD_DIR override." >&2
+  exit 1
+fi
+
+BRIDGE_HOST="${BRIDGE_HOST:-}"
+BRIDGE_SSH_OPTS="${BRIDGE_SSH_OPTS:-}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-3000}"
+REMOTE_PORT="${REMOTE_PORT:-3000}"
+SERVICE_NAME="${SERVICE_NAME:-openclaw}"
+AWS_SECRET_NAME="${AWS_SECRET_NAME:-agent-cody/dashboard/bot-callback-secret}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+
+MODE=full
+for a in "$@"; do
+  case "$a" in
+    --tunnel-only) MODE=tunnel ;;
+    --deploy-only) MODE=deploy ;;
+    --status)      MODE=status ;;
+    -h|--help)
+      awk 'NR==1{next} /^# ?/{sub(/^# ?/,""); print; next} {exit}' "$0"
+      exit 0 ;;
+    *) echo "bridge-up: unknown flag: $a" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$BRIDGE_HOST" ]]; then
+  echo "bridge-up: BRIDGE_HOST is required. Example:" >&2
+  echo "  BRIDGE_HOST=ec2-user@cody-gw.example.com ./bridge-up" >&2
+  exit 2
+fi
+
+# shellcheck disable=SC2206
+SSH_OPTS_ARR=($BRIDGE_SSH_OPTS)
+SSH_BASE=(ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_OPTS_ARR[@]}")
+
+log()  { printf '[bridge-up] %s\n' "$*" >&2; }
+die()  { printf '[bridge-up] ERROR: %s\n' "$*" >&2; exit 1; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+# -------- Preflight --------
+preflight() {
+  need ssh; need scp; need curl
+  [[ -f "$SCRIPT_DIR/cody-bridge-helper" ]] || die "missing sibling script cody-bridge-helper"
+  [[ -f "$SCRIPT_DIR/cody-bridge-sudoers" ]] || die "missing sibling file cody-bridge-sudoers"
+
+  if [[ "$MODE" != "status" && "$MODE" != "deploy" ]]; then
+    if ! curl -fsS -m 2 "http://127.0.0.1:$DASHBOARD_PORT/" >/dev/null 2>&1; then
+      die "nothing answering on http://127.0.0.1:$DASHBOARD_PORT/ — start the dashboard first (cd '$DASHBOARD_DIR' && npm run dev)"
+    fi
+  fi
+
+  if ! "${SSH_BASE[@]}" "$BRIDGE_HOST" true 2>/dev/null; then
+    die "cannot SSH to $BRIDGE_HOST (check key, hostname, SSH agent, or pass BRIDGE_SSH_OPTS=\"-i /path/to/key.pem\")"
+  fi
+}
+
+# -------- Gateway bootstrap (first-run only) --------
+gw_has_helper() {
+  "${SSH_BASE[@]}" "$BRIDGE_HOST" "test -x /usr/local/sbin/cody-bridge-helper"
+}
+
+gw_bootstrap() {
+  if gw_has_helper; then
+    log "gateway helper already installed — skipping bootstrap."
+    return 0
+  fi
+  log "first-run bootstrap: installing gateway helper + sudoers (one interactive sudo prompt)."
+  local stage="/tmp/cody-bridge-bootstrap-$$"
+  scp "${SSH_OPTS_ARR[@]}" \
+      "$SCRIPT_DIR/cody-bridge-helper" \
+      "$SCRIPT_DIR/cody-bridge-sudoers" \
+      "$BRIDGE_HOST:/tmp/" >/dev/null
+  ssh -t "${SSH_OPTS_ARR[@]}" "$BRIDGE_HOST" "
+    set -e
+    sudo install -m 0755 -o root -g root /tmp/cody-bridge-helper /usr/local/sbin/cody-bridge-helper
+    sudo install -m 0440 -o root -g root /tmp/cody-bridge-sudoers /etc/sudoers.d/cody-bridge
+    sudo visudo -cf /etc/sudoers.d/cody-bridge
+    rm -f /tmp/cody-bridge-helper /tmp/cody-bridge-sudoers
+    echo 'bootstrap ok'
+  " >/dev/null
+  log "gateway bootstrap complete."
+}
+
+# -------- Secret sync to AWS Secrets Manager --------
+sync_secret() {
+  need aws
+  local env_file="$DASHBOARD_DIR/.env.local"
+  [[ -f "$env_file" ]] || die "missing $env_file (set CODY_DASHBOARD_DIR if the dashboard repo lives elsewhere)"
+  local secret
+  secret="$(awk -F= '/^BOT_CALLBACK_SECRET=/{sub(/^BOT_CALLBACK_SECRET=/,""); print; exit}' "$env_file")"
+  [[ -n "$secret" ]] || die "BOT_CALLBACK_SECRET not set in $env_file"
+
+  local payload
+  payload="$(printf '{"value":"%s"}' "$secret")"
+
+  if aws --region "$AWS_REGION" secretsmanager describe-secret --secret-id "$AWS_SECRET_NAME" >/dev/null 2>&1; then
+    aws --region "$AWS_REGION" secretsmanager put-secret-value \
+        --secret-id "$AWS_SECRET_NAME" --secret-string "$payload" >/dev/null
+    log "updated Secrets Manager secret '$AWS_SECRET_NAME'."
+  else
+    aws --region "$AWS_REGION" secretsmanager create-secret \
+        --name "$AWS_SECRET_NAME" --secret-string "$payload" >/dev/null
+    log "created Secrets Manager secret '$AWS_SECRET_NAME'."
+  fi
+}
+
+# -------- Skill push --------
+push_skill() {
+  local src="$REPO_ROOT/skills/pair-deeplink/SKILL.md"
+  [[ -f "$src" ]] || die "missing $src"
+  scp "${SSH_OPTS_ARR[@]}" "$src" "$BRIDGE_HOST:/tmp/pair-deeplink-SKILL.md" >/dev/null
+  "${SSH_BASE[@]}" "$BRIDGE_HOST" "sudo -n /usr/local/sbin/cody-bridge-helper install-skill pair-deeplink /tmp/pair-deeplink-SKILL.md && rm -f /tmp/pair-deeplink-SKILL.md" >/dev/null
+  log "skill pair-deeplink installed into /opt/openclaw/workspace/skills/."
+}
+
+# -------- SSH reverse tunnel via ControlMaster --------
+CTL_DIR=""
+CTL_SOCK=""
+tunnel_up=0
+env_set=0
+
+start_tunnel() {
+  CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cody-bridge-XXXXXX")"
+  CTL_SOCK="$CTL_DIR/ctl"
+  log "opening reverse tunnel: gateway 127.0.0.1:$REMOTE_PORT  <-  laptop 127.0.0.1:$DASHBOARD_PORT"
+  ssh "${SSH_OPTS_ARR[@]}" \
+      -M -S "$CTL_SOCK" -fN \
+      -o BatchMode=yes \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -R "127.0.0.1:$REMOTE_PORT:127.0.0.1:$DASHBOARD_PORT" \
+      "$BRIDGE_HOST"
+  tunnel_up=1
+}
+
+verify_tunnel() {
+  if ! ssh -S "$CTL_SOCK" -O check "$BRIDGE_HOST" >/dev/null 2>&1; then
+    die "tunnel master exited unexpectedly"
+  fi
+  if ! "${SSH_BASE[@]}" -S "$CTL_SOCK" "$BRIDGE_HOST" \
+        "curl -fsS -m 3 http://127.0.0.1:$REMOTE_PORT/ -o /dev/null"; then
+    die "gateway cannot reach the laptop dashboard through the tunnel"
+  fi
+  log "tunnel verified end-to-end."
+}
+
+set_dashboard_url() {
+  "${SSH_BASE[@]}" -S "$CTL_SOCK" "$BRIDGE_HOST" \
+    "sudo -n /usr/local/sbin/cody-bridge-helper set-url http://127.0.0.1:$REMOTE_PORT" >/dev/null
+  env_set=1
+  log "DASHBOARD_URL=http://127.0.0.1:$REMOTE_PORT set; $SERVICE_NAME restarted."
+}
+
+teardown() {
+  local ec=$?
+  trap - EXIT INT TERM
+  if [[ "$env_set" == "1" ]]; then
+    log "clearing DASHBOARD_URL on gateway and restarting $SERVICE_NAME…"
+    "${SSH_BASE[@]}" -S "$CTL_SOCK" "$BRIDGE_HOST" \
+      "sudo -n /usr/local/sbin/cody-bridge-helper clear-url" >/dev/null 2>&1 || true
+  fi
+  if [[ "$tunnel_up" == "1" ]]; then
+    ssh -S "$CTL_SOCK" -O exit "$BRIDGE_HOST" >/dev/null 2>&1 || true
+  fi
+  [[ -n "${CTL_DIR:-}" && -d "$CTL_DIR" ]] && rm -rf "$CTL_DIR"
+  if [[ $ec -eq 0 ]]; then log "bridge torn down cleanly."; fi
+  exit $ec
+}
+
+# -------- Main --------
+preflight
+
+if [[ "$MODE" == "status" ]]; then
+  log "querying gateway…"
+  gw_has_helper && echo "  helper:   installed (/usr/local/sbin/cody-bridge-helper)" || echo "  helper:   NOT INSTALLED"
+  "${SSH_BASE[@]}" "$BRIDGE_HOST" "systemctl is-active $SERVICE_NAME || true" | sed 's/^/  service: /'
+  "${SSH_BASE[@]}" "$BRIDGE_HOST" "test -f /run/openclaw/env && grep -E '^DASHBOARD_URL=' /run/openclaw/env || echo '(DASHBOARD_URL not set)'" | sed 's/^/  env:     /'
+  "${SSH_BASE[@]}" "$BRIDGE_HOST" "test -f /opt/openclaw/workspace/skills/pair-deeplink/SKILL.md && echo 'installed' || echo 'MISSING'" | sed 's/^/  skill:   /'
+  exit 0
+fi
+
+if [[ "$MODE" == "full" || "$MODE" == "deploy" ]]; then
+  gw_bootstrap
+  sync_secret
+  push_skill
+fi
+
+if [[ "$MODE" == "deploy" ]]; then
+  log "deploy-only complete. Re-run without --deploy-only to open the tunnel."
+  exit 0
+fi
+
+trap teardown EXIT INT TERM
+start_tunnel
+verify_tunnel
+set_dashboard_url
+
+log "bridge is LIVE. Hit Ctrl-C to tear down cleanly."
+while true; do
+  if ! ssh -S "$CTL_SOCK" -O check "$BRIDGE_HOST" >/dev/null 2>&1; then
+    die "tunnel dropped (SSH master lost). Cleaning up and exiting."
+  fi
+  sleep 20
+done

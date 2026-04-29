@@ -1,0 +1,13 @@
+[
+  {
+    "path": "tools.media.audio.models",
+    "value": [
+      {
+        "type": "cli",
+        "command": "/opt/openclaw/bin/stt-wrapper.sh",
+        "args": ["{{MediaPath}}"],
+        "timeoutSeconds": 120
+      }
+    ]
+  }
+]

@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# cody-up — one command. Gets the whole bridge live against the private
+# Agent Cody gateway. Uses SSM as the SSH transport (no public IP needed),
+# pushes an ephemeral SSH key via SSM run-command, syncs the bot-callback
+# secret, pushes the pair-deeplink skill, opens the reverse tunnel, wires
+# DASHBOARD_URL, restarts openclaw, then blocks. Ctrl-C cleans up.
+#
+# Hard-wired for this setup (override via env if needed):
+#   AWS_PROFILE=technibears
+#   AWS_REGION=us-east-1
+#   INSTANCE Name tag = agent-cody-gw
+#   Linux user on gateway = ubuntu
+#   systemd unit = openclaw
+#   CODY_DASHBOARD_DIR=sibling ../agent-cody-dashboard (recommended)
+#
+# Usage:
+#   scripts/cody-up                 # full run
+#   scripts/cody-up --status        # just report state
+#   scripts/cody-up --tunnel-only   # skip secret/skill push
+#
+set -euo pipefail
+
+export AWS_PROFILE="${AWS_PROFILE:-technibears}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_DEFAULT_REGION="$AWS_REGION"
+
+GW_NAME_TAG="${GW_NAME_TAG:-agent-cody-gw}"
+GW_USER="${GW_USER:-ubuntu}"
+SERVICE_NAME="${SERVICE_NAME:-openclaw}"
+AWS_SECRET_NAME="${AWS_SECRET_NAME:-agent-cody/dashboard/bot-callback-secret}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-3000}"
+REMOTE_PORT="${REMOTE_PORT:-3000}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEFAULT_DASHBOARD_DIR="$(cd "$REPO_ROOT/.." && pwd)/agent-cody-dashboard"
+if [[ -n "${CODY_DASHBOARD_DIR:-}" ]]; then
+  DASHBOARD_DIR="$CODY_DASHBOARD_DIR"
+elif [[ -d "$DEFAULT_DASHBOARD_DIR" ]]; then
+  DASHBOARD_DIR="$DEFAULT_DASHBOARD_DIR"
+else
+  echo "cody-up: dashboard repo not found. Expected sibling $DEFAULT_DASHBOARD_DIR or CODY_DASHBOARD_DIR override." >&2
+  exit 1
+fi
+SKILL_SRC="$REPO_ROOT/skills/pair-deeplink/SKILL.md"
+HELPER_SRC="$SCRIPT_DIR/cody-bridge-helper"
+SUDOERS_SRC="$SCRIPT_DIR/cody-bridge-sudoers"
+
+MODE=full
+for a in "$@"; do
+  case "$a" in
+    --tunnel-only) MODE=tunnel ;;
+    --status)      MODE=status ;;
+    -h|--help)     awk 'NR==1{next} /^# ?/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
+    *) echo "cody-up: unknown flag: $a" >&2; exit 2 ;;
+  esac
+done
+
+log() { printf '[cody-up] %s\n' "$*" >&2; }
+die() { printf '[cody-up] ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing: $1"; }
+
+# ---------- Preflight ----------
+need aws; need ssh; need scp; need ssh-keygen; need curl
+
+if ! command -v session-manager-plugin >/dev/null 2>&1; then
+  cat >&2 <<EOF
+[cody-up] ERROR: session-manager-plugin is not installed.
+Install it once:
+  brew install --cask session-manager-plugin
+or (no brew):
+  curl -fsSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/sessionmanager-bundle.zip" -o /tmp/smp.zip && unzip -q /tmp/smp.zip -d /tmp/smp && sudo /tmp/smp/sessionmanager-bundle/install -i /usr/local/sessionmanagerplugin -b /usr/local/bin/session-manager-plugin
+EOF
+  exit 1
+fi
+
+if ! aws sts get-caller-identity >/dev/null 2>&1; then
+  die "AWS profile '$AWS_PROFILE' not authenticated. Run: aws sso login --profile $AWS_PROFILE  (or: aws login)"
+fi
+log "aws profile=$AWS_PROFILE region=$AWS_REGION authenticated."
+
+[[ -f "$HELPER_SRC"  ]] || die "missing $HELPER_SRC"
+[[ -f "$SUDOERS_SRC" ]] || die "missing $SUDOERS_SRC"
+[[ -f "$SKILL_SRC"   ]] || die "missing $SKILL_SRC"
+
+# ---------- Find the gateway instance ----------
+INSTANCE_ID="$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=$GW_NAME_TAG" "Name=instance-state-name,Values=running,pending" \
+  --query 'Reservations[].Instances[].InstanceId' --output text)"
+[[ -n "$INSTANCE_ID" && "$INSTANCE_ID" != "None" ]] || die "no running instance with Name=$GW_NAME_TAG in $AWS_REGION"
+log "gateway instance: $INSTANCE_ID"
+
+# ---------- Generate ephemeral SSH key ----------
+EPH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cody-up-XXXXXX")"
+EPH_KEY="$EPH_DIR/id_ed25519"
+EPH_PUB="$EPH_DIR/id_ed25519.pub"
+ssh-keygen -q -t ed25519 -N '' -C "cody-up@$(hostname)-$$" -f "$EPH_KEY"
+EPH_PUB_TEXT="$(cat "$EPH_PUB")"
+log "ephemeral key generated: $EPH_KEY"
+
+# ---------- Push key to gateway via SSM ----------
+ssm_run() {
+  local comment="$1"; shift
+  local script="$*"
+  local b64
+  b64="$(printf '%s' "$script" | base64 | tr -d '\n')"
+  local params_file="$EPH_DIR/ssm-params.json"
+  printf '{"commands":["echo %s | base64 -d | bash"]}\n' "$b64" > "$params_file"
+  local cmd_id
+  cmd_id="$(aws ssm send-command \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name AWS-RunShellScript \
+    --comment "$comment" \
+    --parameters "file://$params_file" \
+    --query 'Command.CommandId' --output text)"
+  rm -f "$params_file"
+  aws ssm wait command-executed --command-id "$cmd_id" --instance-id "$INSTANCE_ID" || true
+  local status
+  status="$(aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" --query 'Status' --output text)"
+  if [[ "$status" != "Success" ]]; then
+    aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+      --query '{Status:Status,StdErr:StandardErrorContent,StdOut:StandardOutputContent}' --output text >&2
+    die "ssm command failed ($comment): $status"
+  fi
+  aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+    --query 'StandardOutputContent' --output text
+}
+
+INJECT_SCRIPT=$(cat <<EOS
+set -e
+mkdir -p /home/$GW_USER/.ssh
+touch /home/$GW_USER/.ssh/authorized_keys
+chmod 700 /home/$GW_USER/.ssh
+chmod 600 /home/$GW_USER/.ssh/authorized_keys
+grep -qxF '$EPH_PUB_TEXT' /home/$GW_USER/.ssh/authorized_keys || echo '$EPH_PUB_TEXT' >> /home/$GW_USER/.ssh/authorized_keys
+chown -R $GW_USER:$GW_USER /home/$GW_USER/.ssh
+EOS
+)
+log "injecting ephemeral public key into $GW_USER@$INSTANCE_ID (via SSM)..."
+ssm_run "cody-up inject ephemeral key" "$INJECT_SCRIPT" >/dev/null
+log "ephemeral key installed."
+
+# ---------- SSH via SSM ProxyCommand ----------
+SSH_COMMON=(
+  -i "$EPH_KEY"
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=accept-new
+  -o UserKnownHostsFile="$EPH_DIR/known_hosts"
+  -o "ProxyCommand=aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p --region $AWS_REGION --profile $AWS_PROFILE"
+)
+
+# ---------- Cleanup trap ----------
+CTL_SOCK=""
+tunnel_up=0
+env_set=0
+key_pushed=1
+
+teardown() {
+  local ec=$?
+  trap - EXIT INT TERM
+  if [[ "$env_set" == "1" && -n "$CTL_SOCK" ]]; then
+    log "clearing DASHBOARD_URL + restarting $SERVICE_NAME..."
+    ssh "${SSH_COMMON[@]}" -S "$CTL_SOCK" "$GW_USER@$INSTANCE_ID" \
+      "sudo -n /usr/local/sbin/cody-bridge-helper clear-url" >/dev/null 2>&1 || true
+  fi
+  if [[ "$tunnel_up" == "1" && -n "$CTL_SOCK" ]]; then
+    ssh -S "$CTL_SOCK" -O exit "$GW_USER@$INSTANCE_ID" >/dev/null 2>&1 || true
+  fi
+  if [[ "$key_pushed" == "1" ]]; then
+    log "revoking ephemeral key on gateway..."
+    ssm_run "cody-up revoke ephemeral key" \
+      "sed -i '\\|$EPH_PUB_TEXT|d' /home/$GW_USER/.ssh/authorized_keys || true" >/dev/null 2>&1 || true
+  fi
+  [[ -d "$EPH_DIR" ]] && rm -rf "$EPH_DIR"
+  [[ $ec -eq 0 ]] && log "torn down cleanly."
+  exit $ec
+}
+trap teardown EXIT INT TERM
+
+# ---------- Status mode ----------
+if [[ "$MODE" == "status" ]]; then
+  ssh "${SSH_COMMON[@]}" "$GW_USER@$INSTANCE_ID" "
+    echo '--- helper:' ; test -x /usr/local/sbin/cody-bridge-helper && echo installed || echo MISSING
+    echo '--- service:' ; systemctl is-active $SERVICE_NAME || true
+    echo '--- env:' ; test -f /run/openclaw/env && (grep ^DASHBOARD_URL= /run/openclaw/env || echo '(DASHBOARD_URL unset)') || echo '(/run/openclaw/env absent)'
+    echo '--- skill:' ; test -f /opt/openclaw/workspace/skills/pair-deeplink/SKILL.md && echo installed || echo MISSING
+  "
+  exit 0
+fi
+
+# ---------- Local dashboard up? ----------
+if ! curl -fsS -m 2 "http://127.0.0.1:$DASHBOARD_PORT/" >/dev/null 2>&1; then
+  die "nothing on http://127.0.0.1:$DASHBOARD_PORT/ — start the dashboard first:
+  cd '$DASHBOARD_DIR' && npm run dev"
+fi
+
+# ---------- First-run gateway bootstrap ----------
+log "checking if gateway helper is already installed..."
+HAS_HELPER=1
+ssh "${SSH_COMMON[@]}" "$GW_USER@$INSTANCE_ID" "test -x /usr/local/sbin/cody-bridge-helper" || HAS_HELPER=0
+
+if [[ "$HAS_HELPER" == "0" ]]; then
+  log "first-run bootstrap: installing helper + sudoers..."
+  scp "${SSH_COMMON[@]}" "$HELPER_SRC" "$SUDOERS_SRC" "$GW_USER@$INSTANCE_ID:/tmp/" >/dev/null
+  ssh "${SSH_COMMON[@]}" "$GW_USER@$INSTANCE_ID" "
+    set -e
+    sudo install -m 0755 -o root -g root /tmp/cody-bridge-helper /usr/local/sbin/cody-bridge-helper
+    sudo install -m 0440 -o root -g root /tmp/cody-bridge-sudoers /etc/sudoers.d/cody-bridge
+    sudo visudo -cf /etc/sudoers.d/cody-bridge
+    rm -f /tmp/cody-bridge-helper /tmp/cody-bridge-sudoers
+  " >/dev/null
+  log "helper + sudoers installed."
+fi
+
+# Ensure gateway's fetch-telegram-token.sh preserves DASHBOARD_URL across
+# restarts. Older versions truncate /run/openclaw/env on every start.
+FETCH_SRC="$SCRIPT_DIR/fetch-telegram-token.sh"
+if [[ -f "$FETCH_SRC" ]]; then
+  local_sha="$(shasum -a 256 "$FETCH_SRC" | awk '{print $1}')"
+  remote_sha="$(ssm_run 'cody-up fetch-script sha' \
+    'sha256sum /usr/local/bin/openclaw-fetch-telegram-token.sh 2>/dev/null | awk "{print \$1}" || true' \
+    | tr -d '[:space:]' || true)"
+  if [[ "$local_sha" != "$remote_sha" ]]; then
+    log "updating gateway's openclaw-fetch-telegram-token.sh (preserves non-token env lines)..."
+    fetch_b64="$(base64 < "$FETCH_SRC" | tr -d '\n')"
+    ssm_run "cody-up install fetch-telegram-token" "
+set -e
+echo '$fetch_b64' | base64 -d > /tmp/fts.new
+install -m 0755 -o root -g root /tmp/fts.new /usr/local/bin/openclaw-fetch-telegram-token.sh
+rm -f /tmp/fts.new
+" >/dev/null
+    log "fetch-script replaced."
+  fi
+fi
+
+# ---------- Sync secret + push skill (unless tunnel-only) ----------
+if [[ "$MODE" == "full" ]]; then
+  env_file="$DASHBOARD_DIR/.env.local"
+  [[ -f "$env_file" ]] || die "missing $env_file (set CODY_DASHBOARD_DIR if the dashboard repo lives elsewhere)"
+  secret="$(awk -F= '/^BOT_CALLBACK_SECRET=/{sub(/^BOT_CALLBACK_SECRET=/,""); print; exit}' "$env_file")"
+  [[ -n "$secret" ]] || die "BOT_CALLBACK_SECRET not set in $env_file"
+  payload="$(printf '{"value":"%s"}' "$secret")"
+  if aws secretsmanager describe-secret --secret-id "$AWS_SECRET_NAME" >/dev/null 2>&1; then
+    aws secretsmanager put-secret-value --secret-id "$AWS_SECRET_NAME" --secret-string "$payload" >/dev/null
+    log "Secrets Manager '$AWS_SECRET_NAME' updated."
+  else
+    aws secretsmanager create-secret --name "$AWS_SECRET_NAME" --secret-string "$payload" >/dev/null
+    log "Secrets Manager '$AWS_SECRET_NAME' created."
+  fi
+
+  scp "${SSH_COMMON[@]}" "$SKILL_SRC" "$GW_USER@$INSTANCE_ID:/tmp/pair-deeplink-SKILL.md" >/dev/null
+  ssh "${SSH_COMMON[@]}" "$GW_USER@$INSTANCE_ID" \
+    "sudo -n /usr/local/sbin/cody-bridge-helper install-skill pair-deeplink /tmp/pair-deeplink-SKILL.md && rm -f /tmp/pair-deeplink-SKILL.md" >/dev/null
+  log "pair-deeplink skill installed on gateway."
+fi
+
+# ---------- Open reverse tunnel ----------
+CTL_SOCK="$EPH_DIR/ctl"
+log "opening reverse tunnel (gateway 127.0.0.1:$REMOTE_PORT  <-  laptop 127.0.0.1:$DASHBOARD_PORT)..."
+ssh "${SSH_COMMON[@]}" \
+  -M -S "$CTL_SOCK" -fN \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -R "127.0.0.1:$REMOTE_PORT:127.0.0.1:$DASHBOARD_PORT" \
+  "$GW_USER@$INSTANCE_ID"
+tunnel_up=1
+
+# ---------- Verify + set URL + restart ----------
+if ! ssh "${SSH_COMMON[@]}" -S "$CTL_SOCK" "$GW_USER@$INSTANCE_ID" \
+      "curl -fsS -m 3 http://127.0.0.1:$REMOTE_PORT/ -o /dev/null"; then
+  die "gateway can't reach the laptop dashboard through the tunnel"
+fi
+log "tunnel verified end-to-end."
+
+ssh "${SSH_COMMON[@]}" -S "$CTL_SOCK" "$GW_USER@$INSTANCE_ID" \
+  "sudo -n /usr/local/sbin/cody-bridge-helper set-url http://127.0.0.1:$REMOTE_PORT" >/dev/null
+env_set=1
+log "DASHBOARD_URL set on gateway; $SERVICE_NAME restarted."
+
+# ---------- Block ----------
+log "bridge is LIVE. Ctrl-C to tear down cleanly."
+while true; do
+  if ! ssh -S "$CTL_SOCK" -O check "$GW_USER@$INSTANCE_ID" >/dev/null 2>&1; then
+    die "tunnel dropped"
+  fi
+  sleep 20
+done

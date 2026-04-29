@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+branch="$(git branch --show-current 2>/dev/null || true)"
+branch="${branch:-main}"
+
+printf '\n[agent-cody-bank] Commit recorded on "%s". Push when ready: git push origin %s\n\n' "$branch" "$branch"

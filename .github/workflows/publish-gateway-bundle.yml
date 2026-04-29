@@ -1,0 +1,145 @@
+name: Publish Gateway Bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/**"
+      - "skills/**"
+      - "workspace/**"
+      - ".github/workflows/publish-gateway-bundle.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Require AWS role variable
+        run: |
+          test -n "$AWS_ROLE_TO_ASSUME" || {
+            echo "Set repository variable AWS_ROLE_TO_ASSUME to the GitHub OIDC publish role ARN." >&2
+            exit 1
+          }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Publish bundle to S3
+        run: |
+          set -euo pipefail
+          chmod +x scripts/cody-refresh
+          scripts/cody-refresh --publish | tee publish-manifest.json
+
+      - name: Upload publish manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-bundle-manifest
+          path: publish-manifest.json
+
+      # Auto-deploy: trigger cody-admin --pull-latest on the gateway so the
+      # bundle we just published is applied without a manual SSM call. If the
+      # gateway is stopped or unreachable, this step fails loudly (red X in
+      # the run) — the bundle still sits in S3 for a later manual pull.
+      - name: Resolve gateway instance id
+        id: gw
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Name,Values=agent-cody-gw" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::No running instance tagged Name=agent-cody-gw in $AWS_REGION." >&2
+            exit 1
+          fi
+          echo "gateway instance: $INSTANCE_ID"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger gateway pull-latest
+        id: pull
+        env:
+          INSTANCE_ID: ${{ steps.gw.outputs.instance_id }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "ci-auto-pull-${SHORT_SHA:0:8}" \
+            --parameters 'commands=["sudo -n /usr/local/sbin/openclaw-admin-helper pull-latest --json 2>&1"]' \
+            --timeout-seconds 600 \
+            --query 'Command.CommandId' \
+            --output text)
+          echo "ssm command id: $CMD_ID"
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+          # `aws ssm wait command-executed` defaults to 20 attempts x 5s = 100s,
+          # which is too short: a cold pull-latest can take ~3 min when the
+          # whisper model prefetch runs. Manual poll with an 8-minute ceiling.
+          deadline=$(( $(date +%s) + 480 ))
+          while :; do
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo InProgress)
+            case "$STATUS" in
+              Success) echo "pull-latest: Success"; break ;;
+              Failed|TimedOut|Cancelled)
+                echo "::error::pull-latest returned $STATUS"
+                exit 1
+                ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::pull-latest did not finish within 8 minutes (last status: $STATUS)"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Report gateway pull result
+        if: always() && steps.pull.outputs.command_id != ''
+        env:
+          INSTANCE_ID: ${{ steps.gw.outputs.instance_id }}
+          CMD_ID: ${{ steps.pull.outputs.command_id }}
+        run: |
+          set +e
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --output json > pull-result.json
+          STATUS=$(python3 -c 'import json; print(json.load(open("pull-result.json"))["Status"])')
+          STDOUT=$(python3 -c 'import json; print(json.load(open("pull-result.json")).get("StandardOutputContent","").strip())')
+          STDERR=$(python3 -c 'import json; print(json.load(open("pull-result.json")).get("StandardErrorContent","").strip())')
+          {
+            echo "### gateway pull status: $STATUS"
+            echo '```'
+            [ -n "$STDOUT" ] && printf '%s\n' "$STDOUT"
+            [ -n "$STDERR" ] && { echo "STDERR:"; printf '%s\n' "$STDERR"; }
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$STATUS" = "Success" ]

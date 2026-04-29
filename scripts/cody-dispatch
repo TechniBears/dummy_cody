@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# cody-dispatch — launch a zellij session running Claude Code + Codex CLI
+# side by side, with a git/CI watch tab.
+#
+# First run creates a git worktree at $CODY_CODEX_WORKTREE (default
+# sibling ../agent-cody-codex on branch codex/work) so Codex has an
+# isolated checkout and doesn't trip over Claude Code's uncommitted
+# work in the main worktree.
+#
+# Re-run to reattach or reset the session. Pass --kill to drop the
+# session entirely.
+#
+# Env overrides:
+#   CODY_CODEX_WORKTREE   Path to the Codex worktree. Default:
+#                         ../agent-cody-codex (sibling of the repo).
+#   CODY_CODEX_BRANCH     Branch the worktree tracks. Default: codex/work.
+#   CODY_DISPATCH_SESSION Zellij session name. Default: cody-dispatch.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LAYOUT_FILE="$REPO_ROOT/.zellij/agent-cody.kdl"
+SESSION_NAME="${CODY_DISPATCH_SESSION:-cody-dispatch}"
+CODEX_WORKTREE="${CODY_CODEX_WORKTREE:-$(cd "$REPO_ROOT/.." && pwd)/agent-cody-codex}"
+CODEX_BRANCH="${CODY_CODEX_BRANCH:-codex/work}"
+
+die() { echo "cody-dispatch: $*" >&2; exit 1; }
+
+command -v zellij >/dev/null 2>&1 || \
+  die "zellij not found. Install with: brew install zellij"
+
+# Don't allow nesting inside an existing zellij — zellij panes can't host a
+# second zellij process and it'll error confusingly.
+if [[ -n "${ZELLIJ:-}" ]]; then
+  die "you're already inside a zellij session (${ZELLIJ_SESSION_NAME:-unknown}). Detach first (Ctrl+o d), then re-run from a plain shell."
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "cody-dispatch: warning — 'claude' not on PATH; the claude tab will error." >&2
+fi
+if ! command -v codex >/dev/null 2>&1; then
+  echo "cody-dispatch: warning — 'codex' not on PATH; the codex tab will error." >&2
+fi
+
+if [[ "${1:-}" == "--kill" ]]; then
+  zellij kill-session "$SESSION_NAME" 2>/dev/null || true
+  zellij delete-session "$SESSION_NAME" 2>/dev/null || true
+  echo "killed zellij session: $SESSION_NAME"
+  exit 0
+fi
+
+# Ensure the Codex worktree exists.
+if [[ ! -d "$CODEX_WORKTREE" ]]; then
+  echo "creating Codex worktree at $CODEX_WORKTREE (branch: $CODEX_BRANCH)"
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$CODEX_BRANCH"; then
+    git -C "$REPO_ROOT" worktree add "$CODEX_WORKTREE" "$CODEX_BRANCH"
+  else
+    git -C "$REPO_ROOT" worktree add "$CODEX_WORKTREE" -b "$CODEX_BRANCH"
+  fi
+fi
+
+export CODY_CODEX_WORKTREE="$CODEX_WORKTREE"
+cd "$REPO_ROOT"
+
+# Try to attach to an existing session. zellij attach returns non-zero if the
+# session doesn't exist (older versions print "No active sessions" to stderr
+# and versions differ on how list-sessions formats output, so don't rely on
+# parsing that). If attach fails, fall through and create with the layout.
+if zellij attach "$SESSION_NAME" 2>/dev/null; then
+  exit 0
+fi
+
+echo "launching zellij session: $SESSION_NAME  (layout: $LAYOUT_FILE)"
+exec zellij --session "$SESSION_NAME" --layout "$LAYOUT_FILE"

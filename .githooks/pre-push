@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+has_unstaged=0
+has_staged=0
+has_untracked=0
+
+git diff --quiet || has_unstaged=1
+git diff --cached --quiet || has_staged=1
+if [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  has_untracked=1
+fi
+
+if [[ "$has_unstaged" -eq 1 || "$has_staged" -eq 1 || "$has_untracked" -eq 1 ]]; then
+  printf '\n[agent-cody-bank] Push reminder: you still have local changes that are not committed.\n'
+  git status --short
+  printf '\n'
+fi
+
+# Gateway drift check. Only runs if scripts/cody-refresh is executable AND we
+# have AWS credentials for the technibears profile available. Intentionally
+# non-fatal — prints a warning, does not block the push. Set
+# CODY_SKIP_DRIFT_CHECK=1 to suppress entirely.
+if [[ "${CODY_SKIP_DRIFT_CHECK:-0}" != "1" ]] \
+   && [[ -x "$(git rev-parse --show-toplevel)/scripts/cody-refresh" ]] \
+   && command -v aws >/dev/null 2>&1; then
+  repo_root="$(git rev-parse --show-toplevel)"
+  if AWS_PROFILE="${AWS_PROFILE:-technibears}" aws sts get-caller-identity >/dev/null 2>&1; then
+    printf '[agent-cody-bank] Checking gateway drift (set CODY_SKIP_DRIFT_CHECK=1 to skip)...\n'
+    if ! AWS_PROFILE="${AWS_PROFILE:-technibears}" "$repo_root/scripts/cody-refresh" --check >/dev/null 2>&1; then
+      printf '\n[agent-cody-bank] WARNING: gateway has drifted from repo state.\n'
+      printf '[agent-cody-bank] Run: scripts/cody-refresh --check (to inspect)\n'
+      printf '[agent-cody-bank] Or:  scripts/cody-refresh          (to reconcile)\n\n'
+    else
+      printf '[agent-cody-bank] gateway matches repo. ok.\n'
+    fi
+  fi
+fi

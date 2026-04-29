@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Cody Operator Studio</title>
+  <style>
+    :root {
+      --ink: #10141a;
+      --paper: #f5f0e7;
+      --mist: rgba(245, 240, 231, 0.74);
+      --line: rgba(16, 20, 26, 0.12);
+      --line-strong: rgba(16, 20, 26, 0.24);
+      --teal: #0d7c73;
+      --teal-deep: #0a5e57;
+      --clay: #b85b3c;
+      --sand: #e8dcc7;
+      --white: #fffdf8;
+      --shadow: 0 22px 60px rgba(16, 20, 26, 0.12);
+      --mono: "SFMono-Regular", "JetBrains Mono", "Menlo", monospace;
+      --sans: "Avenir Next", "IBM Plex Sans", "Segoe UI", sans-serif;
+      --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(13, 124, 115, 0.16), transparent 28%),
+        radial-gradient(circle at top right, rgba(184, 91, 60, 0.16), transparent 24%),
+        linear-gradient(180deg, #f9f4eb 0%, #f3ecdf 100%);
+    }
+    a { color: inherit; }
+    .shell {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 28px 20px 56px;
+    }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(135deg, rgba(255,253,248,0.96), rgba(232,220,199,0.92));
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      padding: 28px;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -80px;
+      top: -40px;
+      width: 280px;
+      height: 280px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(13, 124, 115, 0.22), transparent 68%);
+      pointer-events: none;
+    }
+    .eyebrow {
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(16, 20, 26, 0.05);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { margin: 0; }
+    h1 {
+      margin-top: 18px;
+      max-width: 760px;
+      font-family: var(--serif);
+      font-size: clamp(2.8rem, 6vw, 4.8rem);
+      line-height: 0.98;
+      letter-spacing: -0.03em;
+    }
+    .lede {
+      max-width: 760px;
+      margin-top: 16px;
+      font-size: 1.02rem;
+      line-height: 1.7;
+      color: rgba(16, 20, 26, 0.78);
+    }
+    .chip-row, .nav, .signal-grid, .surface-grid, .compare-grid, .growth-grid, .source-grid {
+      display: grid;
+      gap: 16px;
+    }
+    .chip-row {
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      margin-top: 24px;
+    }
+    .chip {
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255, 253, 248, 0.76);
+    }
+    .chip strong {
+      display: block;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: rgba(16, 20, 26, 0.56);
+      margin-bottom: 6px;
+    }
+    .chip span { font-weight: 600; line-height: 1.4; }
+    .nav {
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      margin-top: 22px;
+    }
+    .nav a {
+      text-decoration: none;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(255, 253, 248, 0.64);
+      font-weight: 600;
+    }
+    .section {
+      margin-top: 26px;
+      background: rgba(255, 253, 248, 0.78);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      padding: 24px;
+    }
+    .section-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .section-head h2 {
+      font-family: var(--serif);
+      font-size: clamp(1.7rem, 4vw, 2.6rem);
+      letter-spacing: -0.03em;
+    }
+    .section-head p, .legend {
+      max-width: 760px;
+      color: rgba(16, 20, 26, 0.74);
+      line-height: 1.7;
+      margin: 0;
+    }
+    .signal-grid, .surface-grid, .compare-grid, .growth-grid, .source-grid {
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+    .surface, .tier, .compare, .source {
+      border: 1px solid var(--line);
+      background: var(--white);
+      border-radius: 22px;
+      padding: 18px;
+    }
+    .surface h3, .tier h3, .compare h3, .source h3 {
+      font-size: 1rem;
+      margin-bottom: 10px;
+    }
+    .surface p, .tier p, .compare p, .source p, .signal p, .legend {
+      margin: 0;
+      line-height: 1.65;
+      color: rgba(16, 20, 26, 0.74);
+    }
+    .path {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      background: rgba(13, 124, 115, 0.09);
+      color: var(--teal-deep);
+      text-decoration: none;
+    }
+    .signal {
+      border-radius: 22px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(255,253,248,0.95), rgba(232,220,199,0.82));
+    }
+    .signal strong {
+      display: block;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 0.76rem;
+      color: rgba(16, 20, 26, 0.56);
+    }
+    .signal.hot { border-color: rgba(184, 91, 60, 0.32); }
+    .signal.good { border-color: rgba(13, 124, 115, 0.28); }
+    .signal.warn { border-color: rgba(177, 138, 45, 0.32); }
+    .scenario-toggle {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 18px 0 22px;
+    }
+    .scenario-toggle button {
+      appearance: none;
+      border: 1px solid var(--line-strong);
+      background: rgba(255, 253, 248, 0.78);
+      border-radius: 999px;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .scenario-toggle button.active {
+      background: var(--ink);
+      color: var(--paper);
+      border-color: var(--ink);
+    }
+    .compare-grid .compare { display: none; min-height: 100%; }
+    .compare-grid .compare.active { display: block; }
+    .score {
+      display: inline-block;
+      margin-bottom: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      background: rgba(16, 20, 26, 0.08);
+    }
+    .score.top { background: rgba(13, 124, 115, 0.14); color: var(--teal-deep); }
+    .score.mid { background: rgba(177, 138, 45, 0.16); color: #7f6519; }
+    .score.low { background: rgba(184, 91, 60, 0.14); color: #8f4027; }
+    .stack { display: grid; gap: 14px; margin-top: 18px; }
+    .layer {
+      border-left: 6px solid var(--teal);
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: linear-gradient(90deg, rgba(13, 124, 115, 0.09), rgba(255, 253, 248, 0.9));
+      border: 1px solid rgba(13, 124, 115, 0.18);
+    }
+    .layer.alt {
+      border-left-color: var(--clay);
+      background: linear-gradient(90deg, rgba(184, 91, 60, 0.08), rgba(255, 253, 248, 0.9));
+      border-color: rgba(184, 91, 60, 0.2);
+    }
+    .layer strong { display: block; margin-bottom: 6px; }
+    .tier ul, .compare ul { padding-left: 18px; margin: 12px 0 0; color: rgba(16, 20, 26, 0.78); line-height: 1.65; }
+    .source a {
+      display: inline-block;
+      margin-top: 8px;
+      text-decoration: none;
+      color: var(--teal-deep);
+      font-weight: 600;
+    }
+    @media (max-width: 720px) {
+      .shell { padding: 16px 14px 40px; }
+      .hero, .section { border-radius: 24px; padding: 18px; }
+      .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="eyebrow">Agent Cody Operator Studio</div>
+      <h1>Visual control for Cody's soul, memory, and growth path.</h1>
+      <p class="lede">
+        This is the local operator surface for the OpenClaw-based Agent Cody build. It shows where to edit behavior,
+        what memory is actually live now, what memory should become, and where Ruflo or claude-flow help versus where
+        they still feel too finicky to trust as the primary brain.
+      </p>
+      <div class="chip-row">
+        <div class="chip"><strong>Live Runtime</strong><span>OpenClaw + Bedrock + Telegram</span></div>
+        <div class="chip"><strong>Current Memory</strong><span>OpenClaw builtin</span></div>
+        <div class="chip"><strong>Planned Memory</strong><span>Graphiti + Neo4j</span></div>
+        <div class="chip"><strong>Companion Memory</strong><span>claude-flow sql.js + HNSW</span></div>
+      </div>
+      <nav class="nav">
+        <a href="#surfaces">Edit Surfaces</a>
+        <a href="#reality">Memory Reality</a>
+        <a href="#compare">Compare Options</a>
+        <a href="#stack">Recommended Stack</a>
+        <a href="#growth">Growth Path</a>
+        <a href="#sources">Primary Sources</a>
+      </nav>
+    </section>
+
+    <section class="section" id="surfaces">
+      <div class="section-head">
+        <h2>Edit Surfaces</h2>
+        <p>These are the control points that actually change Cody.</p>
+      </div>
+      <div class="surface-grid">
+        <article class="surface">
+          <h3>SOUL</h3>
+          <p>Behavioral charter. Change red lines, trust model, approval stance, and refusal behavior here.</p>
+          <a class="path" href="../workspace/SOUL.md">workspace/SOUL.md</a>
+        </article>
+        <article class="surface">
+          <h3>AGENTS</h3>
+          <p>Operating playbook. Change preview format, retry behavior, rate limits, and briefing habits here.</p>
+          <a class="path" href="../workspace/AGENTS.md">workspace/AGENTS.md</a>
+        </article>
+        <article class="surface">
+          <h3>Runtime Config</h3>
+          <p>Canonical config renderers and exec policy. Provider, channel, memory, and safe-bin policy live here now.</p>
+          <a class="path" href="../scripts/render_root_openclaw_config.py">scripts/render_root_openclaw_config.py</a>
+          <a class="path" href="../scripts/openclaw_exec_policy.py">scripts/openclaw_exec_policy.py</a>
+        </article>
+        <article class="surface">
+          <h3>Bootstrap</h3>
+          <p>Seeds the OpenClaw workspace. It now prefers the tracked workspace templates instead of hiding everything in heredocs.</p>
+          <a class="path" href="../scripts/openclaw-init.sh">scripts/openclaw-init.sh</a>
+        </article>
+        <article class="surface">
+          <h3>Operator CLI</h3>
+          <p>Open this guide, edit prompt files, or inspect the local claude-flow memory store without digging around manually.</p>
+          <a class="path" href="../scripts/cody-studio.sh">scripts/cody-studio.sh</a>
+        </article>
+        <article class="surface">
+          <h3>Graphiti Guide</h3>
+          <p>Short operator guide for what Graphiti is, why the provider question matters, and how to use the graph memory CLI from Cody Studio.</p>
+          <a class="path" href="../10-graphiti-guide.md">10-graphiti-guide.md</a>
+        </article>
+        <article class="surface">
+          <h3>Text Guide</h3>
+          <p>The markdown version of this control surface, with the memory verdict and links collected in one place.</p>
+          <a class="path" href="../09-operator-studio.md">09-operator-studio.md</a>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="reality">
+      <div class="section-head">
+        <h2>Memory Reality</h2>
+        <p>What is actually true right now, not what the most ambitious README implies.</p>
+      </div>
+      <div class="signal-grid">
+        <article class="signal good">
+          <strong>Working</strong>
+          <p>claude-flow local memory is real: semantic search works, the Agent Cody namespace is present, and the repo is carrying project state in a local <code>sql.js + HNSW</code> store.</p>
+        </article>
+        <article class="signal hot">
+          <strong>Not Fully Live</strong>
+          <p>The deeper <code>AgentDB</code> bridge is not available in this session, and the embeddings subsystem is not initialized. The architecture exists, but not all of it is actually operating.</p>
+        </article>
+        <article class="signal warn">
+          <strong>Finicky Behavior</strong>
+          <p>Observed locally: stale HNSW metadata can keep older versions of a key around even when SQLite stays clean. Result: duplicate semantic hits. The store works, but the vector index needs hygiene.</p>
+        </article>
+        <article class="signal good">
+          <strong>Cody-Specific Truth</strong>
+          <p>Current Cody runtime memory is still OpenClaw builtin. The right business-memory target remains Graphiti, because Cody cares about changing facts over time, not just nearest-neighbor recall.</p>
+        </article>
+      </div>
+      <p class="legend">Use <code>./scripts/cody-studio.sh memory-doctor</code> to inspect the local claude-flow store, and <code>./scripts/cody-studio.sh graphiti smoke</code> to test the Neo4j-backed graph path.</p>
+    </section>
+
+    <section class="section" id="compare">
+      <div class="section-head">
+        <h2>Compare Memory Options</h2>
+        <p>Pick the operating lens. The recommendation stays stable, but the tradeoffs change depending on whether you care about shipping now, operator ergonomics, or research ambition.</p>
+      </div>
+      <div class="scenario-toggle">
+        <button class="active" data-scenario="ship">Ship Now</button>
+        <button data-scenario="operator">Operator Heavy</button>
+        <button data-scenario="research">Research Mode</button>
+      </div>
+      <div class="compare-grid">
+        <article class="compare active" data-scenario="ship">
+          <div class="score top">Best fit now</div>
+          <h3>Graphiti / Zep</h3>
+          <p>Best primary memory for Cody because it models entities, relationships, and validity over time. That is the hard problem in a sales-and-email operator.</p>
+          <ul>
+            <li>Strongest fit for deal state, contact state, and temporal corrections</li>
+            <li>Supports a real memory explorer and timeline later</li>
+            <li>Operationally heavier than a pure vector store, but the model is right</li>
+          </ul>
+        </article>
+        <article class="compare active" data-scenario="ship">
+          <div class="score mid">Useful support layer</div>
+          <h3>claude-flow / AgentDB / RuVector</h3>
+          <p>Strong as a secondary engineering and operator memory. Fast local search. Good place for deployment lessons and recovery patterns. Not the truth store for live customer facts yet.</p>
+          <ul>
+            <li>Useful for project memory and pattern recall</li>
+            <li>Current local install shows partial availability and index quirks</li>
+            <li>Keep it beside Cody, not underneath Cody's business memory</li>
+          </ul>
+        </article>
+        <article class="compare active" data-scenario="ship">
+          <div class="score low">Too generic</div>
+          <h3>OpenClaw builtin only</h3>
+          <p>Fine for short-lived continuity. Wrong as the long-term memory of a business operator because it does not natively express fact invalidation and time-aware truth.</p>
+          <ul>
+            <li>Keep as session cache</li>
+            <li>Do not trust as source of truth</li>
+            <li>Good enough while Graphiti is not wired yet</li>
+          </ul>
+        </article>
+        <article class="compare" data-scenario="operator">
+          <div class="score top">Best operator surface</div>
+          <h3>Letta</h3>
+          <p>If you wanted Cody to feel more like an editable agent OS with explicit memory blocks and rich state control, Letta is attractive. But it would be a runtime commitment, not a small add-on.</p>
+          <ul>
+            <li>Great for visible, editable agent state</li>
+            <li>Heavier shift away from the OpenClaw-centered plan</li>
+            <li>Better for agent state than temporal deal truth</li>
+          </ul>
+        </article>
+        <article class="compare" data-scenario="operator">
+          <div class="score top">Best business fit</div>
+          <h3>Graphiti / Zep</h3>
+          <p>Still the right primary memory. The fact that it is slightly heavier operationally is worth it because it matches the actual business semantics.</p>
+          <ul>
+            <li>Best for timeline-aware briefing and drafting</li>
+            <li>Best for contact and deal graphs</li>
+            <li>Most compatible with the dashboard memory explorer you already designed</li>
+          </ul>
+        </article>
+        <article class="compare" data-scenario="operator">
+          <div class="score mid">Practical helper</div>
+          <h3>Mem0</h3>
+          <p>Fast way to add memory behavior with less operational weight than a graph system, but it is easier to end up with "best matching memory" where you really wanted "currently true fact".</p>
+          <ul>
+            <li>Lower operational friction</li>
+            <li>Less aligned with temporal business state</li>
+            <li>Good if you need simpler memory before Graphiti is ready</li>
+          </ul>
+        </article>
+        <article class="compare" data-scenario="research">
+          <div class="score top">Interesting future accelerator</div>
+          <h3>RuVector / AgentDB / GNN stack</h3>
+          <p>The most interesting research layer here. If you later want learned routing, faster vector analytics, or structural pattern retrieval over operator memory, this is worth revisiting.</p>
+          <ul>
+            <li>Good for pattern memory and developer workflows</li>
+            <li>Promising for analytics and retrieval acceleration</li>
+            <li>Still too ambitious to be Cody's live customer-memory foundation today</li>
+          </ul>
+        </article>
+        <article class="compare" data-scenario="research">
+          <div class="score mid">Composable library path</div>
+          <h3>LangMem</h3>
+          <p>If Cody later drifts toward a more custom LangGraph-based orchestration layer, LangMem becomes interesting as a lighter memory primitive.</p>
+          <ul>
+            <li>Good if the orchestration layer changes</li>
+            <li>Not the shortest path from today's OpenClaw setup</li>
+            <li>Lower commitment than a full agent runtime swap</li>
+          </ul>
+        </article>
+        <article class="compare" data-scenario="research">
+          <div class="score top">Still the business winner</div>
+          <h3>Graphiti / Zep</h3>
+          <p>Even in research mode, Graphiti remains the better primary memory for facts that change over time. GNN retrieval does not replace temporal validity.</p>
+          <ul>
+            <li>Primary truth store stays graph-temporal</li>
+            <li>Experimental vector systems can sit beside it</li>
+            <li>Keep the source of truth boring and correct</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="stack">
+      <div class="section-head">
+        <h2>Recommended Stack</h2>
+        <p>The memory split I would actually run.</p>
+      </div>
+      <div class="stack">
+        <div class="layer"><strong>Layer 1 - OpenClaw builtin</strong>Short-lived session memory only. Let it keep immediate continuity. Do not make it authoritative.</div>
+        <div class="layer alt"><strong>Layer 2 - Graphiti / Neo4j</strong>Primary business memory. Deals, contacts, preferences, historical corrections, and timeline-aware facts live here.</div>
+        <div class="layer"><strong>Layer 3 - claude-flow memory</strong>Secondary engineering and operator memory. Keep platform lessons, AWS incidents, debugging patterns, and repo decisions here.</div>
+        <div class="layer alt"><strong>Layer 4 - RuVector later, if earned</strong>Use only after you prove a real need for faster search or pattern analytics. It is an accelerator layer, not the first layer to trust.</div>
+      </div>
+    </section>
+
+    <section class="section" id="growth">
+      <div class="section-head">
+        <h2>Growth Path</h2>
+        <p>How to grow Cody without turning the system into a mess.</p>
+      </div>
+      <div class="growth-grid">
+        <article class="tier">
+          <h3>Now</h3>
+          <p>Stabilize text replies, edit prompt files directly, and stop burying system behavior in bootstrap scripts.</p>
+          <ul>
+            <li>Use <code>workspace/SOUL.md</code> and <code>workspace/AGENTS.md</code> as source of truth</li>
+            <li>Keep memory simple while Bedrock and Telegram stabilize</li>
+            <li>Use claude-flow memory for project lessons, not customer truth</li>
+          </ul>
+        </article>
+        <article class="tier">
+          <h3>Next</h3>
+          <p>Make Graphiti real and visible.</p>
+          <ul>
+            <li>Use <code>memory-read</code> and <code>memory-write</code> against the <code>graphiti-memory</code> sidecar</li>
+            <li>Add a memory explorer in the dashboard</li>
+            <li>Add a diff-based config commit flow for prompt changes</li>
+          </ul>
+        </article>
+        <article class="tier">
+          <h3>Later</h3>
+          <p>Add acceleration only after the truth model is correct.</p>
+          <ul>
+            <li>Benchmark RuVector against real Cody workloads</li>
+            <li>Consider pattern memory over operator incidents and draft revisions</li>
+            <li>Keep temporal business truth separate from experimental retrieval layers</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="sources">
+      <div class="section-head">
+        <h2>Primary Sources</h2>
+        <p>Current references behind the comparison.</p>
+      </div>
+      <div class="source-grid">
+        <article class="source"><h3>Graphiti</h3><p>Temporal knowledge graph memory and the clearest fit for changing business facts.</p><a href="https://github.com/getzep/graphiti">github.com/getzep/graphiti</a></article>
+        <article class="source"><h3>Mem0</h3><p>General-purpose agent memory layer with a lighter operational path.</p><a href="https://docs.mem0.ai/">docs.mem0.ai</a></article>
+        <article class="source"><h3>Letta</h3><p>Agent-state-heavy runtime with explicit memory blocks and stronger operator feel.</p><a href="https://docs.letta.com/">docs.letta.com</a></article>
+        <article class="source"><h3>LangMem</h3><p>Composable memory primitives for LangGraph-style systems.</p><a href="https://langchain-ai.github.io/langmem/">langchain-ai.github.io/langmem</a></article>
+        <article class="source"><h3>claude-flow</h3><p>Open-source orchestration layer with local HNSW memory and optional RuVector integrations.</p><a href="https://github.com/ruvnet/claude-flow">github.com/ruvnet/claude-flow</a></article>
+        <article class="source"><h3>AgentDB</h3><p>The local cognitive-memory package underneath parts of the claude-flow stack.</p><a href="https://github.com/ruvnet/agentdb">github.com/ruvnet/agentdb</a></article>
+      </div>
+    </section>
+  </div>
+  <script>
+    const buttons = Array.from(document.querySelectorAll('[data-scenario]'));
+    const cards = Array.from(document.querySelectorAll('.compare'));
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const scenario = button.dataset.scenario;
+        buttons.forEach((item) => item.classList.toggle('active', item === button));
+        cards.forEach((card) => card.classList.toggle('active', card.dataset.scenario === scenario));
+      });
+    });
+  </script>
+</body>
+</html>

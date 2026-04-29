@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch OpenClaw config for changes
+Documentation=https://docs.openclaw.ai/
+
+[Path]
+PathChanged=/opt/openclaw/openclaw.json
+Unit=openclaw-config-restart.service
+
+[Install]
+WantedBy=multi-user.target

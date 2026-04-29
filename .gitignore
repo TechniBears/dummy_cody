@@ -1,0 +1,80 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!example.tfvars
+.terraform.lock.hcl
+*.tfplan
+
+# Packer
+packer_cache/
+*.pkrvars.hcl
+!example.pkrvars.hcl
+manifest.json
+*.box
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venvs/
+.venv/
+venv/
+.env
+.swarm/
+scripts/.swarm/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Node
+node_modules/
+npm-debug.log
+pnpm-debug.log
+yarn-error.log
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Secrets + creds
+*.pem
+*.key
+credentials
+.aws-creds
+
+# Evidence (kept local, not committed)
+evidence/
+
+# Private docs / operator context
+docs/
+workspace/
+AGENTS.md
+CLAUDE.md
+CODEX.md
+HANDOVER.md
+SETUP.md
+scripts/BRIDGE.md
+.claude/
+.zellij/
+
+# Lambda build artifacts
+lambdas/*.zip
+
+# Terraform state and bootstrap
+terraform/bootstrap/
+
+# MCP / tooling scratch
+.playwright-mcp/
+scripts/.claude-flow/
+
+# Loose branding/mockup images at repo root (design iterations, not source)
+/technibears-*.png
+/font-mockup.png

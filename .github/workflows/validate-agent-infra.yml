@@ -1,0 +1,133 @@
+name: Validate Agent Infra
+
+on:
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "skills/**"
+      - "workspace/**"
+      - ".github/workflows/**"
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "terraform/github-actions.tf"
+      - "terraform/variables.tf"
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/**"
+      - "skills/**"
+      - "workspace/**"
+      - ".github/workflows/**"
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "terraform/github-actions.tf"
+      - "terraform/variables.tf"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Shell syntax
+        run: |
+          bash -n \
+            scripts/openclaw-init.sh \
+            scripts/cody-refresh \
+            scripts/openclaw-admin-helper \
+            scripts/cody_admin.sh \
+            scripts/provision-tenant.sh
+
+      - name: Python syntax
+        run: |
+          python3 -m py_compile scripts/*.py lambdas/*/handler.py
+
+      - name: Validate root OpenClaw config
+        run: |
+          tmp="$(mktemp)"
+          python3 scripts/render_root_openclaw_config.py > "$tmp"
+          python3 scripts/validate_openclaw_config.py "$tmp"
+          rm -f "$tmp"
+
+      - name: Validate tenant OpenClaw config
+        run: |
+          tmp="$(mktemp)"
+          python3 scripts/render_openclaw_config.py \
+            --tenant ci \
+            --principal-name "CI" \
+            --principal-email ci@example.com \
+            --gateway-port 18801 \
+            --output "$tmp"
+          python3 scripts/validate_openclaw_config.py "$tmp"
+          rm -f "$tmp"
+
+      - name: Validate runtime bootstrap sync
+        run: |
+          root_cfg="$(mktemp)"
+          tenant_cfg="$(mktemp)"
+          root_runtime="$(mktemp -d)"
+          tenant_runtime="$(mktemp -d)"
+
+          python3 scripts/render_root_openclaw_config.py > "$root_cfg"
+          python3 scripts/sync_openclaw_runtime.py \
+            --managed-config "$root_cfg" \
+            --runtime-root "$root_runtime" \
+            --runtime-workspace "$root_runtime/workspace"
+
+          python3 scripts/render_openclaw_config.py \
+            --tenant ci \
+            --principal-name "CI" \
+            --principal-email ci@example.com \
+            --gateway-port 18801 \
+            --output "$tenant_cfg"
+          python3 scripts/sync_openclaw_runtime.py \
+            --managed-config "$tenant_cfg" \
+            --runtime-root "$tenant_runtime" \
+            --runtime-workspace "$tenant_runtime/workspace"
+
+          python3 - "$root_runtime/openclaw.json" "$tenant_runtime/openclaw.json" <<'PY'
+          import json
+          import sys
+
+          for path in sys.argv[1:]:
+              cfg = json.load(open(path, encoding="utf-8"))
+              agents = cfg.get("agents") or {}
+              defaults = agents.get("defaults") or {}
+              model = defaults.get("model") or {}
+              primary = model.get("primary")
+              gateway = cfg.get("gateway") or {}
+
+              # Structural invariants - renderer is the source of truth for the
+              # specific model id; CI just enforces the shape so the gate stays
+              # useful when models are added or swapped.
+              assert primary, f"{path}: agents.defaults.model.primary is unset"
+              provider, _, model_id = primary.partition("/")
+              assert provider, f"{path}: primary {primary!r} missing provider prefix"
+              providers = (cfg.get("models") or {}).get("providers") or {}
+              assert provider in providers, \
+                  f"{path}: provider {provider!r} for primary {primary!r} not declared"
+
+              # Bedrock-specific: model id must be inference-profile form.
+              if provider == "amazon-bedrock":
+                  assert model_id.startswith(("us.", "global.")), \
+                      f"{path}: bedrock primary {primary!r} must use inference-profile id (us.* or global.*)"
+
+              # Gateway shape (existing invariants, kept).
+              assert gateway.get("mode") == "local", f"{path}: gateway.mode != local"
+              assert gateway.get("bind") == "loopback", f"{path}: gateway.bind != loopback"
+              assert ((gateway.get("auth") or {}).get("mode")) == "token", \
+                  f"{path}: gateway.auth.mode != token"
+
+              # Tools / safebins.
+              assert ((cfg.get("tools") or {}).get("exec") or {}).get("safeBins"), \
+                  f"{path}: safeBins missing"
+          PY

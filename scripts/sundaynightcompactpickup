@@ -1,0 +1,110 @@
+Three things to clear up in one pass — voice learning, the Graph confusion, and what's actually missing                                                 
+                                                                                                                                                          
+  1. Voice-to-text — will it get "smarter with your voice"?                                                                                               
+                                                                                                                                                          
+  ★ Insight ─────────────────────────────────────                                                                                                         
+  Short answer: the STT model itself won't learn your voice (that would require fine-tuning, which is months of work). But we can make it much more accurate
+   with two layers of static personalization we haven't turned on yet.                                                                                    
+  ─────────────────────────────────────────────────                                                                                                         
+                                                                                                                                                            
+  - Whisper is frozen weights. Nothing you say gets fed back into training. Same for any of the common STT options (faster-whisper, whisper-ctranslate2,    
+  Deepgram, Assembly AI). Without fine-tuning, the model treats every user identically.                                                                     
+  - What we CAN do — initial_prompt: Whisper accepts a biasing prompt before transcription. We feed it "Known names: {{PRINCIPAL_NAME}}, ContactA, ContactB. Companies:
+   Example Corp. Known words: domain-specific terms." Whisper then biases its phoneme-to-word search toward those tokens. This is the #1 thing to wire up — 15 min of work.                                                                 
+  - What we CAN do — bigger model: Cody claimed it's using Whisper tiny (one of my dispatched agents is verifying that claim right now since it contradicts 
+  the old batch patch path; the current source of truth is scripts/render_root_openclaw_config.py). Our AMI has large-v3-turbo cached and ready. That single 
+  swap jumps accuracy 30-50% on proper nouns without any other change.
+  - Full personalization = tone cloning for drafting, not transcription. That's where "gets smarter with you" actually happens, per the design docs. Covered
+   next.                                                                                                                                                    
+                                                                                
+  2. Tone + personalization — the real learning loop                                                                                                        
+                                                                                                                                                            
+  This is the part you care about long-term. The design (in 05-research-findings.md §5) has three layers:
+                                                                                                                                                            
+  ┌───────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────┐   
+  │     Layer     │                                          How it gets smarter                                           │       Where it lives       │
+  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────┤   
+  │ Style card    │ Offline Lambda runs weekly, pulls your last ~500 sent emails via Graph, distills to a ≤200-token       │ Secret                     │
+  │               │ summary: formality score, typical length, your openings/sign-offs, common phrases, banned phrases.     │ agent-cody/style-card      │
+  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────┤
+  │ Recipient     │ Every time you correct Cody ("ContactA = casual, first-name"), a fact gets written to Graphiti with a  │ Graphiti (Neo4j on the     │
+  │ register      │ timestamp. Future drafts to ContactA auto-use that register.                                           │ Memory VM)                 │
+  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────┤   
+  │ Exemplar      │ For each draft, embed the thread context + Titan embeddings vector-search your past Sent to pull top-3 │ Graphiti graph + embedding │
+  │ retrieval     │  most-similar past emails. Those exemplars go into Claude's prompt.                                    │  index                     │   
+  └───────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────┘
+                                                            
+  Not RL in the gradient-descent sense. The model weights never change. But Claude's context window gets richer and more you-specific over time — so drafts 
+  get increasingly "in your voice" without any training run.                    
+                                                                                                                                                            
+  Status: the plumbing for all three is designed (Phase 3 deliverable per the roadmap) but not built yet. memory-write skill, style-card-refresh Lambda, and
+   tone-draft skill are all stubs today. Phase 2-3 work.                                                                                                    
+                                                                                                                                                            
+  3. Why Cody "can't find the Graph API" — the truth          
+                                                                                                                                                            
+  Cody is wrong about what's missing. Your credentials are fine. What's missing is the OpenClaw skill that uses them.                                       
+                                                                                
+  ┌─────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────┬──────────────────────────────────┐   
+  │                         What exists                         │                       Where                        │            Verified?             │   
+  ├─────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ MSAL refresh tokens for user@outlook.com                     │ secretsmanager://agent-cody/graph-msal-token-cache │ ✅ tested — /me and /me/messages │   
+  │                                                             │                                                    │  returned real data              │   
+  ├─────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ IAM permission for Gateway VM to read the secret            │ attached to agent-cody-gw-role                     │ ✅ live                          │   
+  ├─────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ aws-marketplace:* permissions (Codex's hotfix)              │ inline policy on the role                          │ ✅ live                          │   
+  ├─────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────┤
+  │ An OpenClaw skill named outlook-draft / outlook-queue-send  │ DOES NOT EXIST                                     │ ❌ this is the gap               │   
+  │ that fetches the secret + calls Graph                       │                                                    │                                  │
+  └─────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────┴──────────────────────────────────┘
+                                                                                                                                                            
+  Why Cody's investigation came up empty: Cody looked in /creds/ (the tmpfs OpenClaw uses for plugin-local credentials) and found only the Telegram auth
+  dir. Makes sense — our MSAL tokens live in AWS Secrets Manager, not on local disk, because that's the hardened posture we designed. But OpenClaw          
+  out-of-the-box doesn't know to look in Secrets Manager; it expects skills to fetch their own secrets. Without a skill to bridge SM → Graph API, Cody
+  genuinely has no way to use the tokens.                                                                                                                   
+                                                                                                                                                            
+  Also: the tools.exec.allowlist Cody mentioned (only ffmpeg, whisper-ctranslate2, piper, aws) is our intentional guardrail from SOUL.md. The aws allowance
+  is the hook — a skill can shell out to aws secretsmanager get-secret-value + curl Graph, or equivalent Python/Node. We just haven't written that skill.   
+                                                                                                                                                            
+  4. So what are the actual gaps to close to make "voice note → real sent email" work?                                                                      
+                                                                                                                                                            
+  1. Whisper model fix (15 min) — verify why it's using tiny; switch to large-v3-turbo.
+  2. Initial-prompt glossary for STT (15 min) — pass known names/companies to Whisper so misrecognitions stop.
+  3. outlook-draft + outlook-queue-send + outlook-read OpenClaw skills (2-4 hours) — the actual missing plumbing. One of the agents I just dispatched is
+  researching OpenClaw's exact skill-authoring format so we can hand Codex a complete SKILL.md + tool script as a drop-in.                                  
+  4. Wire graph-sender Lambda to actually send on SEND approval (exists in our Lambda stubs, needs implementation). Phase 2 work.
+                                                                                                                                                            
+  5. On the dashboard "live-node visual" idea — yes, this is great                                                                                          
+                                                                                
+  ★ Insight ─────────────────────────────────────                                                                                                           
+  Live-node pipeline visualization is exactly the right mental model for agent systems. It makes the otherwise-invisible cascade (Telegram → ffmpeg →
+  Whisper → OpenClaw → Bedrock → Graph → S3 → Lambda → Telegram) visible. When something breaks (like "transcription failed"), you can see exactly which    
+  node turned red instead of grepping logs.                                                                                                                 
+  ─────────────────────────────────────────────────                                                                                                         
+                                                                                                                                                            
+  Amending 08-dashboard.md mentally (won't write until you confirm): add a "Pipeline" page with:                                                            
+  - Each component as a node (Telegram adapter, Whisper, Claude, Graph, Piper, etc.)                                                                        
+  - Edges animate when data flows through them (pulse animation on WebSocket events)                                                                        
+  - Node colors: green (idle), blue (active), amber (warning), red (failed)                            
+  - Click a node → drawer with last 10 invocations + timings + tokens-used (for LLM nodes) + error rate                                                     
+  - Useful moments: "why is Cody slow?" → you see Whisper node is amber with long processing times → debug at the right layer
+                                                                                                                                                            
+  Stack for this page: React Flow (already in the dashboard stack) + D3 for animations + WebSocket subscription to OpenClaw's event stream. 2-3 days of
+  implementation inside Phase 3.                                                                                                                            
+                                                                                
+  6. What my dispatched agents are doing right now                                                                                                          
+                                                                                                       
+  - Agent A — researching OpenClaw skill authoring format: SKILL.md schema, tool invocation contract, how skills access AWS Secrets Manager. Goal: return a 
+  complete outlook-draft skill as drop-in code. This is the unlock for Cody actually drafting real emails.                                                  
+  - Agent B — investigating the "Whisper tiny" claim vs our config. Finding out what OpenClaw uses by default + how to force our stt-wrapper.sh to be       
+  canonical.                                                                                                                                                
+                                                                                                                                                            
+  Both running in the background. When they return I'll integrate + hand Codex a complete skill file + audio config fix. You don't need to do anything for  
+  that — keep testing / using Cody; the signal we've gathered so far is enough to build from.                                                               
+                                                                                                       
+  Bottom-line answer to the conversation you pasted                                                                                                         
+                                                                                                       
+  Cody is being honest and correct: from inside OpenClaw's process view, there's no email plugin. But Cody doesn't know the credentials exist in AWS Secrets
+   Manager because no skill has been wired to check there. The fix is not "re-do SSO" (you already did it perfectly) — the fix is ship the missing skills.  
+  Agent A will return with the exact blueprint.                      
+                                                               

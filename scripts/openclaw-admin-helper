@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# openclaw-admin-helper — root-owned gateway maintenance helper.
+# Intended to be callable only via a tight sudoers rule for the `openclaw`
+# service user. Never accepts arbitrary commands.
+#
+# Commands:
+#   status [--json]
+#   restart [--json]
+#   refresh-snapshot [--json]
+#   pull-latest [--json]
+#
+# restart:
+#   Schedules `systemctl restart openclaw.service` a couple seconds in the
+#   future so the current request can return before the service exits.
+#
+# refresh-snapshot:
+#   Re-runs the last deployed repo snapshot from /opt/openclaw-admin/repo and
+#   then schedules the same delayed restart.
+#
+# pull-latest:
+#   Downloads the latest published deploy bundle from S3, applies it locally,
+#   then schedules the same delayed restart.
+set -euo pipefail
+
+SERVICE="openclaw.service"
+CONFIG="/opt/openclaw/openclaw.json"
+SNAPSHOT_ROOT="/opt/openclaw-admin/repo"
+SNAPSHOT_INIT="$SNAPSHOT_ROOT/scripts/openclaw-init.sh"
+VALIDATOR="/opt/openclaw/bin/validate-openclaw-config"
+DEPLOY_STATE="/opt/openclaw-admin/deploy-state.json"
+DEPLOY_BUNDLE="/usr/local/bin/openclaw-deploy-bundle"
+
+usage() {
+  awk 'NR==1{next} /^# ?/{sub(/^# ?/,""); print; next} {exit}' "$0"
+  exit 1
+}
+
+json_string() {
+  python3 - "$1" <<'PY'
+import json, sys
+print(json.dumps(sys.argv[1]))
+PY
+}
+
+service_state() {
+  systemctl is-active "$SERVICE" 2>/dev/null || true
+}
+
+validator_state() {
+  if [[ -x "$VALIDATOR" && -f "$CONFIG" ]]; then
+    if python3 "$VALIDATOR" "$CONFIG" >/dev/null 2>&1; then
+      echo "valid"
+    else
+      echo "invalid"
+    fi
+  else
+    echo "unknown"
+  fi
+}
+
+snapshot_state() {
+  if [[ -x "$SNAPSHOT_INIT" ]]; then
+    echo "present"
+  else
+    echo "missing"
+  fi
+}
+
+deploy_state_field() {
+  local field="$1"
+  [[ -f "$DEPLOY_STATE" ]] || return 0
+  python3 - "$DEPLOY_STATE" "$field" <<'PY'
+import json, sys
+path, field = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except Exception:
+    raise SystemExit(0)
+value = data.get(field, "")
+if isinstance(value, str):
+    print(value)
+PY
+}
+
+latest_bundle_sha() {
+  [[ -x "$DEPLOY_BUNDLE" ]] || return 0
+  python3 "$DEPLOY_BUNDLE" latest 2>/dev/null | python3 -c 'import json,sys; print((json.load(sys.stdin)).get("bundle_sha256",""))' 2>/dev/null || true
+}
+
+schedule_restart() {
+  local unit="openclaw-admin-restart-$(date +%s)"
+  systemd-run --unit "$unit" --on-active=2 --service-type=oneshot /bin/systemctl restart "$SERVICE" >/dev/null
+}
+
+purge_per_agent_state() {
+  # OpenClaw bug class #47705: fallback gets baked into per-agent state
+  # and survives restarts, overriding the managed config. Purge before
+  # every restart so managed config is always re-derived.
+  local archived=0
+  while IFS= read -r -d '' f; do
+    if cp -a "$f" "$f.purged.$(date +%s)" 2>/dev/null; then
+      rm -f "$f"
+      archived=$((archived+1))
+    fi
+  done < <(find /opt/openclaw/.openclaw/agents -maxdepth 2 -name agents.json -print0 2>/dev/null)
+  echo "purged $archived per-agent state file(s)" >&2
+}
+
+print_status() {
+  local fmt="$1"
+  local state snapshot validator current_sha latest_sha update_available
+  state="$(service_state)"
+  snapshot="$(snapshot_state)"
+  validator="$(validator_state)"
+  current_sha="$(deploy_state_field bundle_sha256)"
+  latest_sha="$(latest_bundle_sha)"
+  update_available="unknown"
+  if [[ -n "$latest_sha" ]]; then
+    if [[ "$latest_sha" == "$current_sha" && -n "$current_sha" ]]; then
+      update_available="false"
+    else
+      update_available="true"
+    fi
+  fi
+  if [[ "$fmt" == "json" ]]; then
+    printf '{\n'
+    printf '  "ok": true,\n'
+    printf '  "service": %s,\n' "$(json_string "$state")"
+    printf '  "snapshot": %s,\n' "$(json_string "$snapshot")"
+    printf '  "config_validation": %s,\n' "$(json_string "$validator")"
+    printf '  "current_bundle_sha256": %s,\n' "$(json_string "$current_sha")"
+    printf '  "latest_bundle_sha256": %s,\n' "$(json_string "$latest_sha")"
+    printf '  "update_available": %s\n' "$(json_string "$update_available")"
+    printf '}\n'
+  else
+    printf 'service=%s\n' "$state"
+    printf 'snapshot=%s\n' "$snapshot"
+    printf 'config_validation=%s\n' "$validator"
+    printf 'current_bundle_sha256=%s\n' "$current_sha"
+    printf 'latest_bundle_sha256=%s\n' "$latest_sha"
+    printf 'update_available=%s\n' "$update_available"
+  fi
+}
+
+print_action() {
+  local fmt="$1"
+  local action="$2"
+  local detail="$3"
+  if [[ "$fmt" == "json" ]]; then
+    printf '{\n'
+    printf '  "ok": true,\n'
+    printf '  "action": %s,\n' "$(json_string "$action")"
+    printf '  "detail": %s\n' "$(json_string "$detail")"
+    printf '}\n'
+  else
+    printf '%s\n' "$detail"
+  fi
+}
+
+apply_bundle_from_s3() {
+  local stage bundle manifest bundle_sha
+  [[ -x "$DEPLOY_BUNDLE" ]] || { echo "pull-latest: missing $DEPLOY_BUNDLE" >&2; exit 2; }
+  stage="$(mktemp -d /tmp/openclaw-admin-bundle.XXXXXX)"
+  bundle="$stage/bundle.tgz"
+  manifest="$stage/manifest.json"
+  python3 "$DEPLOY_BUNDLE" fetch-latest --output "$bundle" --manifest-output "$manifest" >/dev/null
+  bundle_sha="$(python3 - "$manifest" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("bundle_sha256", ""))
+PY
+)"
+  tar -xzf "$bundle" -C "$stage"
+  [[ -x "$stage/scripts/openclaw-init.sh" ]] || { echo "pull-latest: bundle missing scripts/openclaw-init.sh" >&2; rm -rf "$stage"; exit 2; }
+  OPENCLAW_DEPLOY_BUNDLE_SHA="$bundle_sha" OPENCLAW_DEPLOY_SOURCE="s3-pull-latest" bash "$stage/scripts/openclaw-init.sh" >/tmp/openclaw-admin-pull-latest.log 2>&1
+  rm -rf "$stage"
+}
+
+fmt="text"
+cmd="${1:-}"
+shift || true
+
+# set-model takes a positional model arg before --json
+model_arg=""
+if [[ "$cmd" == "set-model" ]]; then
+  model_arg="${1:-}"
+  [[ -n "$model_arg" ]] || { echo "usage: openclaw-admin-helper set-model <alias|provider/id> [--json]" >&2; exit 2; }
+  shift
+fi
+
+if [[ "${1:-}" == "--json" ]]; then
+  fmt="json"
+  shift
+fi
+[[ $# -eq 0 ]] || usage
+
+case "$cmd" in
+  status)
+    print_status "$fmt"
+    ;;
+  restart)
+    purge_per_agent_state
+    schedule_restart
+    print_action "$fmt" "restart" "per-agent state purged; openclaw restart scheduled"
+    ;;
+  refresh-snapshot)
+    [[ -x "$SNAPSHOT_INIT" ]] || { echo "refresh-snapshot: missing $SNAPSHOT_INIT" >&2; exit 2; }
+    OPENCLAW_DEPLOY_SOURCE="local-snapshot" bash "$SNAPSHOT_INIT" >/tmp/openclaw-admin-refresh.log 2>&1
+    purge_per_agent_state
+    schedule_restart
+    print_action "$fmt" "refresh-snapshot" "snapshot reapplied; per-agent state purged; openclaw restart scheduled"
+    ;;
+  pull-latest)
+    apply_bundle_from_s3
+    purge_per_agent_state
+    schedule_restart
+    # Announce on Telegram once the new bundle is applied. Backgrounded with a
+    # 5-second delay so the systemd-run restart fires first and the announce
+    # reflects the freshly-loaded config. Idempotent + cooldown inside the script.
+    ( sleep 5 && /usr/bin/python3 "$SNAPSHOT_ROOT/scripts/announce_restore.py" ) >/dev/null 2>&1 &
+    print_action "$fmt" "pull-latest" "latest published bundle applied; per-agent state purged; openclaw restart scheduled; telegram announce queued"
+    ;;
+  set-model)
+    /usr/bin/python3 "$SNAPSHOT_ROOT/scripts/set_primary_model.py" "$model_arg" --json --no-restart
+    purge_per_agent_state
+    schedule_restart
+    print_action "$fmt" "set-model" "primary model set to $model_arg; per-agent state purged; openclaw restart scheduled"
+    ;;
+  *)
+    usage
+    ;;
+esac

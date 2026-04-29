@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# cody-refresh — one command to sync local repo state onto the private
+# Agent Cody gateway and restart the openclaw service. Reuses the SSM
+# RunShellScript transport already used by cody-up, so no SSH, no public IP,
+# no keys to rotate.
+#
+# Subcommands:
+#   (default)   full refresh:
+#                 1. tarball workspace/ + skills/ + scripts/ helpers
+#                 2. publish the bundle to S3
+#                 3. push to gateway via SSM
+#                 4. run scripts/openclaw-init.sh on the gateway (rewrites
+#                    /opt/openclaw/openclaw.json, reinstalls helper bins,
+#                    wipes + repopulates /opt/openclaw/workspace/skills,
+#                    refreshes workspace/*.md)
+#                 5. systemctl restart openclaw
+#                 6. verify active + print new safeBins + skill dir
+#   --publish    publish the latest repo bundle to S3 only. No gateway changes.
+#   --restart   just restart the service. No file push.
+#   --status    print service state, deployed safeBins, and skill list.
+#   --check     diff repo state vs gateway state. Exit 0 clean, 1 on drift,
+#               2 on error. No mutations. Use in a pre-push hook.
+#   --help
+#
+# Env (override rarely):
+#   AWS_PROFILE      optional. If unset, ambient AWS credentials are used.
+#   AWS_REGION       default: us-east-1
+#   GW_NAME_TAG      default: agent-cody-gw
+#   SERVICE_NAME     default: openclaw
+#
+set -euo pipefail
+
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_DEFAULT_REGION="$AWS_REGION"
+
+GW_NAME_TAG="${GW_NAME_TAG:-agent-cody-gw}"
+SERVICE_NAME="${SERVICE_NAME:-openclaw}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+MODE=full
+for a in "$@"; do
+  case "$a" in
+    --publish)       MODE=publish ;;
+    --restart)       MODE=restart ;;
+    --status)        MODE=status ;;
+    --check)         MODE=check ;;
+    -h|--help)
+      awk 'NR==1{next} /^# ?/{sub(/^# ?/,""); print; next} {exit}' "$0"
+      exit 0 ;;
+    *) echo "cody-refresh: unknown flag: $a" >&2; exit 2 ;;
+  esac
+done
+
+log() { printf '[cody-refresh] %s\n' "$*" >&2; }
+die() { printf '[cody-refresh] ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+need aws
+need tar
+need base64
+need python3
+
+require_aws_auth() {
+  if aws sts get-caller-identity >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -n "${AWS_PROFILE:-}" ]]; then
+    die "AWS profile '$AWS_PROFILE' not authenticated. Run: aws sso login --profile $AWS_PROFILE"
+  fi
+
+  die "AWS credentials not available. Export AWS_PROFILE or ambient AWS credentials first."
+}
+
+resolve_instance_id() {
+  INSTANCE_ID="$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=$GW_NAME_TAG" "Name=instance-state-name,Values=running,pending" \
+    --query 'Reservations[].Instances[].InstanceId' --output text)"
+  [[ -n "$INSTANCE_ID" && "$INSTANCE_ID" != "None" ]] \
+    || die "no running instance with tag Name=$GW_NAME_TAG in $AWS_REGION"
+  log "gateway: $INSTANCE_ID"
+}
+
+render_local_config() {
+  /usr/bin/python3 "$REPO_ROOT/scripts/render_root_openclaw_config.py"
+}
+
+validate_local_config() {
+  local tmp
+  tmp="$(mktemp -t cody-refresh-config.XXXXXX.json)"
+  render_local_config >"$tmp"
+  /usr/bin/python3 "$REPO_ROOT/scripts/validate_openclaw_config.py" "$tmp" >&2
+  rm -f "$tmp"
+}
+
+# ---------- run_remote: dispatch one bash script via SSM, block, print output ----------
+# Strategy: base64-encode the script, pass as a single /bin/sh command that
+# decodes into a temp file and invokes bash on it. Avoids every quoting/heredoc
+# trap SSM's AWS-RunShellScript (which invokes /bin/sh, not bash) likes to set.
+run_remote() {
+  local comment="$1"; shift
+  local script="$1"
+  local params_file cmd_id status b64
+  b64="$(printf '%s' "$script" | base64 | tr -d '\n')"
+  params_file="$(mktemp -t cody-refresh-ssm.XXXXXX.json)"
+  /usr/bin/python3 - "$b64" >"$params_file" <<'PY'
+import json, sys
+b64 = sys.argv[1]
+cmd = (
+  "set -e; "
+  "tmp=$(mktemp /tmp/cody-refresh-run.XXXXXX.sh); "
+  "printf '%s' '" + b64 + "' | base64 -d > \"$tmp\"; "
+  "bash \"$tmp\"; rc=$?; rm -f \"$tmp\"; exit $rc"
+)
+json.dump({"commands": [cmd], "executionTimeout": ["900"]}, sys.stdout)
+PY
+  cmd_id="$(aws ssm send-command \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name AWS-RunShellScript \
+    --comment "$comment" \
+    --timeout-seconds 900 \
+    --parameters "file://$params_file" \
+    --query 'Command.CommandId' --output text)"
+  rm -f "$params_file"
+  log "ssm command: $cmd_id ($comment)"
+  status=Pending
+  while [[ "$status" == "Pending" || "$status" == "InProgress" ]]; do
+    sleep 3
+    status="$(aws ssm get-command-invocation \
+      --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+      --query 'Status' --output text 2>/dev/null || echo InProgress)"
+  done
+  local out err
+  out="$(aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+    --query 'StandardOutputContent' --output text 2>/dev/null || true)"
+  err="$(aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+    --query 'StandardErrorContent' --output text 2>/dev/null || true)"
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  [[ -n "$err" ]] && printf '%s\n' "$err" >&2
+  [[ "$status" == "Success" ]] || die "remote $comment: $status"
+}
+
+# ---------- Modes ----------
+case "$MODE" in
+  status)
+    require_aws_auth
+    resolve_instance_id
+    run_remote "cody-refresh: status" '
+set +e
+echo "===SERVICE==="
+systemctl is-active '"$SERVICE_NAME"'
+echo "===BINS==="
+ls /opt/openclaw/bin/ 2>/dev/null || echo "(no /opt/openclaw/bin)"
+echo "===ADMIN==="
+test -x /usr/local/sbin/openclaw-admin-helper && echo "helper=installed" || echo "helper=missing"
+test -f /etc/sudoers.d/openclaw-admin && echo "sudoers=installed" || echo "sudoers=missing"
+test -x /usr/local/bin/openclaw-deploy-bundle && echo "deploy_bundle=installed" || echo "deploy_bundle=missing"
+test -x /opt/openclaw-admin/repo/scripts/openclaw-init.sh && echo "snapshot=present" || echo "snapshot=missing"
+test -f /opt/openclaw-admin/deploy-state.json && echo "deploy_state=present" || echo "deploy_state=missing"
+if test -f /opt/openclaw-admin/deploy-state.json; then
+  echo "===DEPLOY_STATE==="
+  cat /opt/openclaw-admin/deploy-state.json
+fi
+echo "===SKILLS==="
+ls /opt/openclaw/workspace/skills/ 2>/dev/null || echo "(no skills dir)"
+echo "===RUNTIME_SKILLS==="
+ls /opt/openclaw/.openclaw/workspace/skills/ 2>/dev/null || echo "(no runtime skills dir)"
+echo "===safeBins==="
+sudo -n cat /opt/openclaw/openclaw.json 2>/dev/null | /usr/bin/python3 -c "
+import json,sys
+try:
+    c=json.load(sys.stdin)
+    e=c.get(\"tools\",{}).get(\"exec\",{})
+    print(\"safeBins=\", e.get(\"safeBins\"))
+    print(\"profiles=\", sorted((e.get(\"safeBinProfiles\") or {}).keys()))
+    print(\"primaryModel=\", ((c.get(\"agents\") or {}).get(\"defaults\") or {}).get(\"model\", {}).get(\"primary\"))
+except Exception as x:
+    print(\"could-not-parse-config:\", x)
+"
+echo "===runtimeSafeBins==="
+sudo -n cat /opt/openclaw/.openclaw/openclaw.json 2>/dev/null | /usr/bin/python3 -c "
+import json,sys
+try:
+    c=json.load(sys.stdin)
+    e=c.get(\"tools\",{}).get(\"exec\",{})
+    print(\"safeBins=\", e.get(\"safeBins\"))
+    print(\"profiles=\", sorted((e.get(\"safeBinProfiles\") or {}).keys()))
+    print(\"primaryModel=\", ((c.get(\"agents\") or {}).get(\"defaults\") or {}).get(\"model\", {}).get(\"primary\"))
+except Exception as x:
+    print(\"could-not-parse-runtime-config:\", x)
+"'
+    exit 0
+    ;;
+  restart)
+    require_aws_auth
+    resolve_instance_id
+    run_remote "cody-refresh: restart $SERVICE_NAME" '
+set -e
+sudo systemctl restart '"$SERVICE_NAME"'
+# Service takes ~20s to fully initialize; check at 3s and again at 25s.
+sleep 3
+s1="$(systemctl is-active '"$SERVICE_NAME"')"
+sleep 22
+s2="$(systemctl is-active '"$SERVICE_NAME"')"
+echo "state: ${s1} -> ${s2}"
+systemctl status '"$SERVICE_NAME"' --no-pager -n 5 2>&1 | head -12
+'
+    exit 0
+    ;;
+  publish)
+    require_aws_auth
+    validate_local_config
+    TAR="$(mktemp -t cody-refresh.XXXXXX.tgz)"
+    trap 'rm -f "$TAR"' EXIT
+    log "packaging repo → $TAR"
+    COPYFILE_DISABLE=1 tar --exclude='.DS_Store' --exclude='._*' -czf "$TAR" -C "$REPO_ROOT" \
+      workspace/BOOTSTRAP.md workspace/IDENTITY.md \
+      workspace/HANDOFF.md workspace/SKILLS.md \
+      workspace/README.md workspace/TOOLS.md workspace/USER.md \
+      skills \
+      scripts/openclaw.service \
+      scripts/openclaw-config-restart.service \
+      scripts/openclaw-config-restart.path \
+      scripts/morning-brief.service \
+      scripts/morning-brief.timer \
+      scripts/openclaw-init.sh \
+      scripts/openclaw_exec_policy.py \
+      scripts/cody_admin.sh \
+      scripts/openclaw-admin-helper \
+      scripts/openclaw-admin-sudoers \
+      scripts/deploy_bundle.py \
+      scripts/memory_read.py scripts/memory_write.py \
+      scripts/outlook_read.py \
+	      scripts/outlook_draft.py scripts/outlook_queue_send.py \
+	      scripts/outlook_send_approved.py \
+	      scripts/render_root_openclaw_config.py \
+	      scripts/render_openclaw_config.py \
+	      scripts/set_primary_model.py \
+	      scripts/announce_restore.py \
+	      scripts/calendar_read.py \
+	      scripts/calendar_write.py \
+	      scripts/sync_openclaw_runtime.py \
+	      scripts/validate_openclaw_config.py \
+	      scripts/graph-token-fresh.py scripts/graphiti_memory.py \
+	      scripts/morning-brief.py \
+	      scripts/stt-wrapper.sh
+    MANIFEST="$(/usr/bin/python3 "$REPO_ROOT/scripts/deploy_bundle.py" publish --bundle "$TAR" --source cody-refresh)"
+    printf '%s\n' "$MANIFEST"
+    log "published."
+    exit 0
+    ;;
+  check)
+    require_aws_auth
+    resolve_instance_id
+    # Build an "expected" manifest from the repo, ship it to the gateway,
+    # compute the "actual" manifest there, diff, and print drift. Exit 0
+    # clean, 1 on drift, 2 on error. No mutations.
+    validate_local_config
+    MANIFEST="$(/usr/bin/python3 - "$REPO_ROOT" <<'PY'
+import hashlib, json, subprocess, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+m = {"skills": {}, "runtime_skills": {}, "bins": {}, "workspace": {}, "systemd": {}, "privileged": {}, "config": {}, "runtime_config": {}}
+
+# Skills: /opt/openclaw/workspace/skills/<name>/SKILL.md
+for skill_md in sorted((root / "skills").glob("*/SKILL.md")):
+    m["skills"][skill_md.parent.name] = sha(skill_md)
+m["runtime_skills"] = dict(m["skills"])
+
+# Bins: scripts/<src>.py -> /opt/openclaw/bin/<deployed-name>
+bins_map = {
+    "memory_read.py": "memory-read",
+    "memory_write.py": "memory-write",
+    "outlook_read.py": "outlook-read",
+    "outlook_draft.py": "outlook-draft",
+    "outlook_queue_send.py": "outlook-queue-send",
+    "outlook_send_approved.py": "outlook-send-approved",
+    "cody_admin.sh": "cody-admin",
+    "validate_openclaw_config.py": "validate-openclaw-config",
+    "graph-token-fresh.py": "graph-token-fresh.py",
+    "stt-wrapper.sh": "stt-wrapper.sh",
+    "morning-brief.py": "morning-brief",
+}
+for src, bin_name in bins_map.items():
+    p = root / "scripts" / src
+    if p.exists():
+        m["bins"][bin_name] = sha(p)
+
+# Workspace markdown: /opt/openclaw/workspace/<name>.md
+for md in sorted((root / "workspace").glob("*.md")):
+    m["workspace"][md.name] = sha(md)
+
+for unit_name in (
+    "openclaw.service",
+    "openclaw-config-restart.service",
+    "openclaw-config-restart.path",
+    "morning-brief.service",
+    "morning-brief.timer",
+):
+    p = root / "scripts" / unit_name
+    if p.exists():
+        m["systemd"][unit_name] = sha(p)
+
+for src, remote_name in (
+    ("openclaw-admin-helper", "openclaw-admin-helper"),
+    ("openclaw-admin-sudoers", "openclaw-admin"),
+    ("deploy_bundle.py", "openclaw-deploy-bundle"),
+):
+    p = root / "scripts" / src
+    if p.exists():
+        m["privileged"][remote_name] = sha(p)
+
+rendered = subprocess.check_output([sys.executable, str(root / "scripts" / "render_root_openclaw_config.py")])
+rendered_cfg = json.loads(rendered)
+exec_cfg = rendered_cfg.get("tools", {}).get("exec", {})
+m["config"]["sha"] = hashlib.sha256(rendered).hexdigest()
+m["config"]["safeBins"] = exec_cfg.get("safeBins")
+m["config"]["profileNames"] = sorted((exec_cfg.get("safeBinProfiles") or {}).keys())
+m["config"]["primaryModel"] = ((rendered_cfg.get("agents") or {}).get("defaults") or {}).get("model", {}).get("primary")
+m["runtime_config"]["safeBins"] = exec_cfg.get("safeBins")
+m["runtime_config"]["profileNames"] = sorted((exec_cfg.get("safeBinProfiles") or {}).keys())
+m["runtime_config"]["primaryModel"] = ((rendered_cfg.get("agents") or {}).get("defaults") or {}).get("model", {}).get("primary")
+
+print(json.dumps(m))
+PY
+)"
+    MANIFEST_B64="$(printf '%s' "$MANIFEST" | base64 | tr -d '\n')"
+    # Remote: python reads expected manifest via env, hashes deployed files,
+    # writes diff JSON. Non-zero exit code means drift detected.
+    REMOTE_CHECK="
+set -e
+MANIFEST_B64='$MANIFEST_B64'
+export MANIFEST_B64
+/usr/bin/python3 - <<'PY'
+import base64, hashlib, json, os, sys
+from pathlib import Path
+sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest() if Path(p).is_file() else None
+
+expected = json.loads(base64.b64decode(os.environ['MANIFEST_B64']))
+actual = {'skills': {}, 'runtime_skills': {}, 'bins': {}, 'workspace': {}, 'systemd': {}, 'privileged': {}, 'config': {}, 'runtime_config': {}}
+
+skills_dir = Path('/opt/openclaw/workspace/skills')
+if skills_dir.is_dir():
+    for d in sorted(skills_dir.iterdir()):
+        skill_md = d / 'SKILL.md'
+        if skill_md.is_file():
+            actual['skills'][d.name] = sha(skill_md)
+
+runtime_skills_dir = Path('/opt/openclaw/.openclaw/workspace/skills')
+if runtime_skills_dir.is_dir():
+    for d in sorted(runtime_skills_dir.iterdir()):
+        skill_md = d / 'SKILL.md'
+        if skill_md.is_file():
+            actual['runtime_skills'][d.name] = sha(skill_md)
+
+bin_dir = Path('/opt/openclaw/bin')
+if bin_dir.is_dir():
+    for f in sorted(bin_dir.iterdir()):
+        if f.is_file():
+            actual['bins'][f.name] = sha(f)
+
+ws_dir = Path('/opt/openclaw/workspace')
+if ws_dir.is_dir():
+    for f in sorted(ws_dir.glob('*.md')):
+        actual['workspace'][f.name] = sha(f)
+
+for unit_name in (
+    'openclaw.service',
+    'openclaw-config-restart.service',
+    'openclaw-config-restart.path',
+    'morning-brief.service',
+    'morning-brief.timer',
+):
+    unit_path = Path('/etc/systemd/system') / unit_name
+    if unit_path.is_file():
+        actual['systemd'][unit_name] = sha(unit_path)
+
+for remote_name, remote_path in (
+    ('openclaw-admin-helper', '/usr/local/sbin/openclaw-admin-helper'),
+    ('openclaw-admin', '/etc/sudoers.d/openclaw-admin'),
+    ('openclaw-deploy-bundle', '/usr/local/bin/openclaw-deploy-bundle'),
+):
+    p = Path(remote_path)
+    if p.is_file():
+        actual['privileged'][remote_name] = sha(p)
+
+cfg_path = Path('/opt/openclaw/openclaw.json')
+if cfg_path.is_file():
+    try:
+        cfg = json.loads(cfg_path.read_text())
+        e = cfg.get('tools', {}).get('exec', {})
+        actual['config']['sha'] = sha(cfg_path)
+        actual['config']['safeBins'] = e.get('safeBins')
+        actual['config']['profileNames'] = sorted((e.get('safeBinProfiles') or {}).keys())
+        actual['config']['primaryModel'] = ((cfg.get('agents') or {}).get('defaults') or {}).get('model', {}).get('primary')
+    except Exception as x:
+        actual['config']['error'] = str(x)
+
+runtime_cfg_path = Path('/opt/openclaw/.openclaw/openclaw.json')
+if runtime_cfg_path.is_file():
+    try:
+        cfg = json.loads(runtime_cfg_path.read_text())
+        e = cfg.get('tools', {}).get('exec', {})
+        actual['runtime_config']['sha'] = sha(runtime_cfg_path)
+        actual['runtime_config']['safeBins'] = e.get('safeBins')
+        actual['runtime_config']['profileNames'] = sorted((e.get('safeBinProfiles') or {}).keys())
+        actual['runtime_config']['primaryModel'] = ((cfg.get('agents') or {}).get('defaults') or {}).get('model', {}).get('primary')
+    except Exception as x:
+        actual['runtime_config']['error'] = str(x)
+
+diff = {'missing': [], 'drifted': [], 'orphaned': [], 'config': []}
+for section in ('skills', 'runtime_skills', 'bins', 'workspace', 'systemd', 'privileged'):
+    exp = expected.get(section, {})
+    act = actual.get(section, {})
+    for name, esh in exp.items():
+        ash = act.get(name)
+        if ash is None:
+            diff['missing'].append(f'{section}/{name}')
+        elif ash != esh:
+            diff['drifted'].append(f'{section}/{name}')
+    for name in act:
+        if name not in exp:
+            diff['orphaned'].append(f'{section}/{name}')
+
+# Config checks
+exp_cfg = expected.get('config', {})
+act_cfg = actual.get('config', {})
+if exp_cfg.get('sha') and act_cfg.get('sha') != exp_cfg.get('sha'):
+    diff['config'].append(f\"config_sha: expected {exp_cfg['sha']}, actual {act_cfg.get('sha')}\")
+if exp_cfg.get('safeBins') and act_cfg.get('safeBins') != exp_cfg.get('safeBins'):
+    diff['config'].append(f\"safeBins: expected {exp_cfg['safeBins']}, actual {act_cfg.get('safeBins')}\")
+if exp_cfg.get('profileNames') and act_cfg.get('profileNames') != exp_cfg.get('profileNames'):
+    diff['config'].append(f\"profileNames: expected {exp_cfg['profileNames']}, actual {act_cfg.get('profileNames')}\")
+if exp_cfg.get('primaryModel') and act_cfg.get('primaryModel') != exp_cfg.get('primaryModel'):
+    diff['config'].append(f\"primaryModel: expected {exp_cfg['primaryModel']}, actual {act_cfg.get('primaryModel')}\")
+
+exp_runtime_cfg = expected.get('runtime_config', {})
+act_runtime_cfg = actual.get('runtime_config', {})
+if exp_runtime_cfg.get('safeBins') and act_runtime_cfg.get('safeBins') != exp_runtime_cfg.get('safeBins'):
+    diff['config'].append(f\"runtime_safeBins: expected {exp_runtime_cfg['safeBins']}, actual {act_runtime_cfg.get('safeBins')}\")
+if exp_runtime_cfg.get('profileNames') and act_runtime_cfg.get('profileNames') != exp_runtime_cfg.get('profileNames'):
+    diff['config'].append(f\"runtime_profileNames: expected {exp_runtime_cfg['profileNames']}, actual {act_runtime_cfg.get('profileNames')}\")
+if exp_runtime_cfg.get('primaryModel') and act_runtime_cfg.get('primaryModel') != exp_runtime_cfg.get('primaryModel'):
+    diff['config'].append(f\"runtime_primaryModel: expected {exp_runtime_cfg['primaryModel']}, actual {act_runtime_cfg.get('primaryModel')}\")
+
+drift = any(diff[k] for k in diff)
+print(json.dumps({'drift': drift, 'diff': diff}, indent=2))
+# Exit 0 regardless so SSM treats the command as Success; the laptop
+# parses the JSON for drift detection.
+PY
+"
+    CHECK_OUT="$(run_remote "cody-refresh: check" "$REMOTE_CHECK")"
+    printf '%s\n' "$CHECK_OUT"
+    if printf '%s' "$CHECK_OUT" | grep -q '"drift": true'; then
+      log "DRIFT DETECTED — re-run 'cody-refresh' (default mode) to reconcile."
+      exit 1
+    fi
+    log "clean — gateway matches repo."
+    exit 0
+    ;;
+  full)
+    require_aws_auth
+    resolve_instance_id
+    validate_local_config
+    TAR="$(mktemp -t cody-refresh.XXXXXX.tgz)"
+    trap 'rm -f "$TAR"' EXIT
+
+    log "packaging repo → $TAR"
+    COPYFILE_DISABLE=1 tar --exclude='.DS_Store' --exclude='._*' -czf "$TAR" -C "$REPO_ROOT" \
+      workspace/BOOTSTRAP.md workspace/IDENTITY.md \
+      workspace/HANDOFF.md workspace/SKILLS.md \
+      workspace/README.md workspace/TOOLS.md workspace/USER.md \
+      skills \
+      scripts/openclaw.service \
+      scripts/openclaw-config-restart.service \
+      scripts/openclaw-config-restart.path \
+      scripts/morning-brief.service \
+      scripts/morning-brief.timer \
+      scripts/openclaw-init.sh \
+      scripts/openclaw_exec_policy.py \
+      scripts/cody_admin.sh \
+      scripts/openclaw-admin-helper \
+      scripts/openclaw-admin-sudoers \
+      scripts/deploy_bundle.py \
+      scripts/memory_read.py scripts/memory_write.py \
+      scripts/outlook_read.py \
+	      scripts/outlook_draft.py scripts/outlook_queue_send.py \
+	      scripts/outlook_send_approved.py \
+	      scripts/render_root_openclaw_config.py \
+	      scripts/render_openclaw_config.py \
+	      scripts/set_primary_model.py \
+	      scripts/announce_restore.py \
+	      scripts/calendar_read.py \
+	      scripts/calendar_write.py \
+	      scripts/sync_openclaw_runtime.py \
+	      scripts/validate_openclaw_config.py \
+	      scripts/graph-token-fresh.py scripts/graphiti_memory.py \
+	      scripts/morning-brief.py \
+      scripts/stt-wrapper.sh
+    MANIFEST="$(/usr/bin/python3 "$REPO_ROOT/scripts/deploy_bundle.py" publish --bundle "$TAR" --source cody-refresh)"
+    BUNDLE_SHA="$(printf '%s' "$MANIFEST" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_sha256"])')"
+    log "published bundle sha=$BUNDLE_SHA"
+    run_remote "cody-refresh: pull-latest + verify" "
+set -euo pipefail
+echo '===PULL LATEST==='
+sudo -n /usr/local/sbin/openclaw-admin-helper pull-latest --json 2>&1
+sleep 3
+s1=\"\$(systemctl is-active $SERVICE_NAME || true)\"
+sleep 27
+s2=\"\$(systemctl is-active $SERVICE_NAME || true)\"
+echo \"service-state: \${s1} -> \${s2}\"
+echo '===VERIFY==='
+sudo -n cat /opt/openclaw/openclaw.json | /usr/bin/python3 -c \"
+import json,sys
+c=json.load(sys.stdin)
+e=c['tools']['exec']
+print('safeBins=', e['safeBins'])
+print('profiles=', sorted(e.get('safeBinProfiles',{}).keys()))
+print('primaryModel=', ((c.get('agents') or {}).get('defaults') or {}).get('model', {}).get('primary'))
+\"
+sudo -n cat /opt/openclaw/.openclaw/openclaw.json | /usr/bin/python3 -c \"
+import json,sys
+c=json.load(sys.stdin)
+e=(c.get('tools') or {}).get('exec') or {}
+print('runtimeSafeBins=', e.get('safeBins'))
+print('runtimeProfiles=', sorted((e.get('safeBinProfiles') or {}).keys()))
+print('runtimePrimaryModel=', ((c.get('agents') or {}).get('defaults') or {}).get('model', {}).get('primary'))
+\"
+echo 'skills:'; ls /opt/openclaw/workspace/skills/
+echo 'bins:'; ls /opt/openclaw/bin/
+"
+    log "done."
+    ;;
+esac
