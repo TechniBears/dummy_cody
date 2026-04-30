@@ -5,13 +5,13 @@ Personal AI operator -- configurable per principal. Telegram voice/text in, Outl
 Runs on a single EC2 gateway (us-east-1) with OpenClaw, Bedrock, and a Neo4j memory sidecar.
 
 ## Quick start
-
+**you need to know some aws here or ask claude to write you a script at this point tbh**
 Push to `main` and CI handles everything: bundle to S3, SSM to gateway, restart. No laptop scripts needed.
 
 ```
 git push origin main    # CI publishes + deploys automatically
 ```
-
+**hes retard but better everyday**
 On Telegram, Cody responds to natural language. No skill names needed:
 - "check my email" / "draft a reply to Sarah" / "what's on my calendar?"
 - "/model sonnet" to switch models on the fly
